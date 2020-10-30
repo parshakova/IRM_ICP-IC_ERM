@@ -339,7 +339,8 @@ def plot_results_irm_erm(sol_dict, ns):
     axs[1].set_xticklabels((str(n) for n in ns))
     axs[1].set_title("||Phi_ort||")
 
-    plt.show()
+    plt.savefig('irm_erm_curves.png')
+    #plt.show()
 
 
 
@@ -372,7 +373,7 @@ if __name__ == '__main__':
 
     if args["setup_sem"] == "irm_erm_simple":
         sol_dict = {}
-        ns = [1000, 3000, 5000, 10000]
+        ns = [1000, 3000, 5000, 10000, 50000]
         for n in ns:
             args["n_samples"] = n
             n_sol_dict = find_betas(args)
