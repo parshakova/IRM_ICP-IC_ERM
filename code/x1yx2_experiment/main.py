@@ -320,7 +320,7 @@ def plot_results_irm_erm(sol_dict, ns):
 
             elif method == "IRM":
                 
-                for (reg, u_norm, phi_norm) in sol_dict[n][method]:
+                for (reg, phi_norm, u_norm) in sol_dict[n][method]:
                     xs[reg] += [u_norm] 
                     phi_ort_norms[reg] += [phi_norm]
 
@@ -328,7 +328,7 @@ def plot_results_irm_erm(sol_dict, ns):
             axs[0].plot(ind, xs, label  = method)
         elif method == "IRM":
             for reg in regs:
-                axs[0].plot(ind, xs[reg], label  = method+" %.5f"%reg)
+                axs[0].plot(ind, xs[reg], label  = method+" %.1e"%reg)
 
     axs[0].set_xticks(ind)
     axs[0].set_xticklabels((str(n) for n in ns))
@@ -336,10 +336,11 @@ def plot_results_irm_erm(sol_dict, ns):
     axs[0].set_title("||u-u_hat||")
 
     for reg in regs:
-        axs[1].plot(ind, phi_ort_norms[reg], label  = "%.5f"%reg)
+        axs[1].plot(ind, phi_ort_norms[reg], label  = "%.1e"%reg)
     axs[1].set_xticks(ind)
     axs[1].set_xticklabels((str(n) for n in ns))
     axs[1].set_title("||Phi_ort||")
+    axs[1].legend(prop={'size': 10})
 
     plt.savefig('irm_erm_curves.png')
     #plt.show()
