@@ -259,7 +259,7 @@ def plot_results(sol_dict, ns, dim):
         axs[i].legend(prop={'size': 10})
         axs[i].set_title('N = %d'%n)
 
-
+    plt.savefig('plot_betas.png')
     
     # plot bars for causal - non causal errors
     fig, axs = plt.subplots(nrows=2, ncols=len(ns)) 
@@ -286,7 +286,7 @@ def plot_results(sol_dict, ns, dim):
                 axs[k,i].set_title('Nonc N = %d'%n)
 
 
-    plt.show()
+    plt.savefig('plot_caus_noncaus.png')
 
 
 def plot_results_irm_erm(sol_dict, ns):

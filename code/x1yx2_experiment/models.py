@@ -193,7 +193,7 @@ class InvariantCausalPrediction(object):
 
                         elif args["cond_in"] == 'pval':
                             p_value_j = get_pvalue([j], x_all, y_S, e_all)
-                            # if [j] is not causal => null hypothesis is rejected
+                            # if [j] is causal => null hypothesis is not rejected
                             if p_value_j < self.alpha:
                                 flag = True
 
