@@ -236,7 +236,7 @@ def run_experiment(args):
 
     return all_solutions, sol_dict
 
-def plot_results(sol_dict, ns, dim):
+def plot_results(sol_dict, ns, dim, args):
     """
     sol_dict[n][method_name] = [beta, err_causal, err_noncausal]
     method_name in {IRM, ICP, ERM} 
@@ -259,7 +259,7 @@ def plot_results(sol_dict, ns, dim):
         axs[i].legend(prop={'size': 10})
         axs[i].set_title('N = %d'%n)
 
-    plt.savefig('plot_betas.png')
+    plt.savefig('plot_betas%s.png'%args["env_rat"])
     
     # plot bars for causal - non causal errors
     fig, axs = plt.subplots(nrows=2, ncols=len(ns)) 
@@ -286,7 +286,7 @@ def plot_results(sol_dict, ns, dim):
                 axs[k,i].set_title('Nonc N = %d'%n)
 
 
-    plt.savefig('plot_caus_noncaus.png')
+    plt.savefig('plot_caus_noncaus%s.png'%args["env_rat"])
 
 
 def plot_results_irm_erm(sol_dict, ns):
@@ -390,7 +390,7 @@ if __name__ == '__main__':
             print("n = %d"%n)
             print("\n".join(all_solutions))
             sol_dict[n] = n_sol_dict
-        plot_results(sol_dict, ns, args["dim"])
+        plot_results(sol_dict, ns, args["dim"], args)
     else:
         all_solutions,_ = run_experiment(args)
         print("\n".join(all_solutions))
