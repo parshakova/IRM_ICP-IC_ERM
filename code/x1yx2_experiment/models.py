@@ -185,7 +185,7 @@ class InvariantCausalPrediction(object):
                                 for (gamma_ej, delta_ej) in gammas:
 
                                     delta = np.sqrt(delta_e**2 + delta_ej**2)
-                                    if np.abs(gamma_e - gamma_ej) > 2.5*delta:
+                                    if np.abs(gamma_e - gamma_ej) > 2*delta:
                                         # outside of confidence interval
                                         flag = True
                                 

@@ -5,8 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 #
 
-# Plot SEM
-# python main.py --n_iterations 50000 --n_reps 1 --n_samples 1500 --dim 10 --k 4 --env_list 3 --env_rat 1:1:1 --seed 123  --cond_in eq_conf --plot 1
+
 
 import random
 import torch

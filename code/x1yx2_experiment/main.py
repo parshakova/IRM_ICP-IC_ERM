@@ -260,6 +260,7 @@ def plot_results(sol_dict, ns, dim, args):
         axs[i].set_title('N = %d'%n)
 
     plt.savefig('plot_betas%s.png'%args["env_rat"])
+    plt.show()
     
     # plot bars for causal - non causal errors
     fig, axs = plt.subplots(nrows=2, ncols=len(ns)) 
@@ -286,7 +287,8 @@ def plot_results(sol_dict, ns, dim, args):
                 axs[k,i].set_title('Nonc N = %d'%n)
 
 
-    plt.savefig('plot_caus_noncaus%s.png'%args["env_rat"])
+    #plt.savefig('plot_caus_noncaus%s.png'%args["env_rat"])
+    plt.show()
 
 
 def plot_results_irm_erm(sol_dict, ns):
@@ -383,7 +385,7 @@ if __name__ == '__main__':
 
     elif args["plot"]:
         sol_dict = {}
-        ns = [150, 600, 1500, 2400, 3000]
+        ns = [150, 600, 1500, 2400, 3000, 5000]
         for n in ns:
             args["n_samples"] = n
             all_solutions, n_sol_dict = run_experiment(args)
@@ -394,3 +396,9 @@ if __name__ == '__main__':
     else:
         all_solutions,_ = run_experiment(args)
         print("\n".join(all_solutions))
+
+# Plot SEM
+# python main.py --n_iterations 50000 --n_reps 1 --dim 10 --k 4 --env_list 3 --env_rat 1:1:1 --seed 123  --cond_in eq_conf --plot 1
+# IRM vs ERM
+# python main.py --n_iterations 100000 --n_reps 1 --n_samples 1500 --dim 5 --env_list 3 --env_rat 1:1:1 --seed 123 --setup_sem irm_erm_simple
+
