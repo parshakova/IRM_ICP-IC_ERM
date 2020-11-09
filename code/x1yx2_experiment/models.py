@@ -20,6 +20,7 @@ import scipy.optimize
 
 import matplotlib
 import matplotlib.pyplot as plt
+import statsmodels.api as sm
 
 
 def pretty(vector):
@@ -95,6 +96,7 @@ class InvariantRiskMinimization(object):
 class InvariantCausalPrediction(object):
     def __init__(self, environments, args, orders=None):
         def get_pvalue(subset, x_all, y_all, e_all):
+            # null hypothesis = S is causal
             x_s = x_all[:, subset]
             reg = LinearRegression(fit_intercept=False).fit(x_s, y_all)
 
@@ -116,10 +118,7 @@ class InvariantCausalPrediction(object):
         self.coefficients = None
         self.alpha = args["alpha"]
 
-        x_all = []
-        y_all = []
-        e_all = []
-
+        x_all = []; y_all = []; e_all = []
 
 
         for e, (x, y) in enumerate(environments):
@@ -127,9 +126,7 @@ class InvariantCausalPrediction(object):
             y_all.append(y.numpy())
             e_all.append(np.full(x.shape[0], e))
 
-        x_all = np.vstack(x_all)
-        y_all = np.vstack(y_all)
-        e_all = np.hstack(e_all)
+        x_all = np.vstack(x_all); y_all = np.vstack(y_all); e_all = np.hstack(e_all)
 
         dim = x_all.shape[1]
         omega_set = set(range(dim))
@@ -153,40 +150,60 @@ class InvariantCausalPrediction(object):
                     y_S = (y_all - reg.predict(x_s)).ravel()
 
 
-                    flag = False
-                    gammas = []
                     js = omega_set - set(subset)
+
+                    exists_causal_j = False
 
                     for j in sorted(list(js)):
                         gammas = []
                         x_j =  x_all[:, j:j+1]
-                        if args["cond_in"] == 'eq':
+                        flag = False # flag == False only if j in S^c is causal  
+                        if args["cond_in"] == 'eq_abs':
                             for e in range(len(environments)):
                                 e_idx = np.where(e_all == e)[0]
-                                reg_je = LinearRegression(fit_intercept=False).fit(x_j[e_idx, :], y_S[e_idx])
-                                gamma_e = reg_je.coef_
-                                #gamma_e = (y_S[e_idx] - reg_je.predict(x_j[e_idx, :])).ravel()
+                                reg_je = LinearRegression().fit(x_j[e_idx, :], y_S[e_idx])
+                                gamma_e = reg_je.coef_[0]
+                                # check if gamma_e 's are close to each other
                                 for gamma in gammas:
-                                    if np.allclose(gamma, gamma_e, rtol=1e-1, atol=1e-2):
+                                    if np.abs(gamma-gamma_e) > 1e-1:
                                         flag = True
-                                        #break
                                 
                                 gammas += [gamma_e]
 
+                        elif args["cond_in"] == 'eq_conf':
+                            for e in range(len(environments)):
+                                e_idx = np.where(e_all == e)[0]
+                                res = sm.OLS(endog=y_S[e_idx], exog=x_j[e_idx, :]).fit()
+                                # gamma is 1D
+                                # get confidence interval for gamma_ek and combine it with c.i. of gamma_em, 
+                                # i.e. (gamma_1 - gamma_2) +/- delta
+                                # if |gamma_1 - gamma_2| > 2*delta  ==>  gamma_1 != gamma_2
+                                ci_gamma_e = res.conf_int(0.05).squeeze()
+                                gamma_e = np.mean(ci_gamma_e)
+                                delta_e = ci_gamma_e[1] - gamma_e
+                                
+                                for (gamma_ej, delta_ej) in gammas:
+
+                                    delta = np.sqrt(delta_e**2 + delta_ej**2)
+                                    if np.abs(gamma_e - gamma_ej) > 2.5*delta:
+                                        # outside of confidence interval
+                                        flag = True
+                                
+                                gammas += [(gamma_e, delta_e)]
+
                         elif args["cond_in"] == 'pval':
                             p_value_j = get_pvalue([j], x_all, y_S, e_all)
-                            if p_value_j > self.alpha:
+                            # if [j] is not causal => null hypothesis is rejected
+                            if p_value_j < self.alpha:
                                 flag = True
 
-                        if subset == tuple(range(args["k"]-1)):
-                            print(j, subset, js)
-                            print([g[0] for g in gammas])
+                        if flag == False:
+                            # j is causal
+                            exists_causal_j = True
+                            break
 
-                        #if flag:
-                            #print(gammas)
-                            #break
-
-                    if not flag:
+                    if exists_causal_j == False:
+                        # exists mismatched pair for all j's => all gammas are NOT similar for that j in S^c
                         accepted_subsets.append(set(subset))
                         if args["verbose"]:
                                 print("Accepted subset:", subset, "p_value:", p_value)
