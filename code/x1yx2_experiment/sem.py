@@ -68,16 +68,16 @@ class SEM_X1YX2X3(object):
         x1 = torch.normal(mean=torch.zeros(n*self.k), std=torch.ones(n*self.k)*self.v).view(n,  self.k)
         
         y = (x1 @ self.theta_pl).sum(1, keepdim=True) + epsilon
-        get_var(y, "y")
-        get_var_cov(x1,y, "x1")
+        #get_var(y, "y")
+        #get_var_cov(x1,y, "x1")
         self.theta_mi = torch.diag(torch.tensor(np.random.choice([-self.beta, self.beta], self.k, p=[0.5, 0.5])))
         print("theta-\n", self.theta_mi)
         # sample X2 from changing distribution: effects
         x2 = y.repeat(1, self.k) @ self.theta_mi + w
-        get_var_cov(x2, y, "x2")
+        #get_var_cov(x2, y, "x2")
         x3 = torch.normal(mean=torch.zeros(n*(self.p - 2*self.k)), \
             std=torch.ones(n*(self.p - 2*self.k))*self.v).view(n, self.p - 2*self.k)
-        get_var_cov(x3, y, "x3")
+        #get_var_cov(x3, y, "x3")
         x23 = torch.cat((x2, x3), 1)
         
         if self.shuffle:
