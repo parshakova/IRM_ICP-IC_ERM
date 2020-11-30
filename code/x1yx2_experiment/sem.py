@@ -13,7 +13,6 @@ from itertools import chain, combinations
 import numpy as np
 
 class SEM_X1YX2X3(object):
-    # 
     def __init__(self, p, k, ones=True, scramble=False, hetero=True, hidden=False, shuffle=True):
         self.hetero = hetero
         self.hidden = hidden
@@ -68,8 +67,6 @@ class SEM_X1YX2X3(object):
         x1 = torch.normal(mean=torch.zeros(n*self.k), std=torch.ones(n*self.k)*self.v).view(n,  self.k)
         
         y = (x1 @ self.theta_pl).sum(1, keepdim=True) + epsilon
-        #get_var(y, "y")
-        #get_var_cov(x1,y, "x1")
         self.theta_mi = torch.diag(torch.tensor(np.random.choice([-self.beta, self.beta], self.k, p=[0.5, 0.5])))
         print("theta-\n", self.theta_mi)
         # sample X2 from changing distribution: effects
@@ -98,6 +95,7 @@ class IRM_ERM_SimpleEnvs(object):
     def __init__(self, dim, k=None, ones=True, scramble=False, hetero=True, hidden=False):
         self.dim = dim 
         self.betas = []
+        self.sigma = 0.05
 
 
     def solution(self):
@@ -105,10 +103,11 @@ class IRM_ERM_SimpleEnvs(object):
 
     def __call__(self, n, env):
         x = torch.normal(mean=torch.zeros(n*self.dim), std=torch.ones(n*self.dim)).view(n,  self.dim)
+        epsilon = torch.normal(mean=torch.zeros(n), std=torch.ones(n)*self.sigma).view(n,  1)
 
         beta = torch.randn(self.dim, 1) * (env+1)
 
-        y = torch.matmul(x, beta)
+        y = torch.matmul(x, beta) + epsilon
 
         self.betas += [beta]
 

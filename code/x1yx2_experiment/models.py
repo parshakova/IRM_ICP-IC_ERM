@@ -66,23 +66,26 @@ class InvariantRiskMinimization(object):
 
         self.pairs = []; self.betas = []; self.ws = []
 
-        
         if population == 1:
-            regs = [0.5, 1, 10, 50, ]
-            #regs = [1e-5, 1e-4, 1e-3, 1e-2, 1e-1]
+            if args["setup_sem"] == "irm_popul":
+                regs = [10.]
+            else:
+                regs = [1e-5, 1e-4, 1e-3, 1e-2, 1e-1]
         else:
             regs = [0, 1e-5, 1e-4, 1e-3, 1e-2, 1e-1]
 
         for reg in regs:
-            if population == 1:
+            if population:
                 # population risk minimization
                 if orig_risk == False:
-                    err = self.train_popul(betas, args, reg=reg).item()
+                    # optimize loss with transformed regularization term
+                    err = self.train_popul_transformed_reg(betas, args, reg=reg, init_true=args["phi_init"]).item()
                 elif orig_risk == True :
-                    err = self.train_popul2(betas, args, reg=reg, init_true=args["phi_init"]).item()
+                    # optimize loss with original regularization term
+                    err = self.train_popul_orig_reg(betas, args, reg=reg, init_true=args["phi_init"]).item()
             else:
                 # empricial risk minimization
-                self.train(environments[:-1], args, reg=reg)
+                self.train_transformed_reg(environments[:-1], args, reg=reg)
                 err = (x_val @ self.solution() - y_val).pow(2).mean().item()
 
             if args["verbose"]:
@@ -104,25 +107,12 @@ class InvariantRiskMinimization(object):
         self.reg = best_reg
         self.beta = self.phi @ self.w
 
-    def train_popul2(self, betas, args, reg=0, patience=10, init_true=0):
+    def train_popul_orig_reg(self, betas, args, reg=0, patience=8, init_true=0):
         dim_x = betas[0].size(0)
 
-        if init_true == 1:
-            self.phi = torch.nn.Parameter(torch.diag(torch.mean(torch.stack(betas),dim=0).squeeze()))
-            if args["train_w"] == 1:
-                self.w = torch.nn.Parameter(torch.ones(dim_x, 1))
-            else:
-                self.w = torch.ones(dim_x, 1)
-                self.w.requires_grad = True
-        else:
-            self.phi = torch.nn.Parameter(torch.randn(dim_x, dim_x))
-            if args["train_w"] == 1:
-                self.w = torch.nn.Parameter(torch.randn(dim_x, 1))
-            else:
-                self.w = torch.randn(dim_x, 1)
-                self.w.requires_grad = True
+        train_w = args["train_w"] == 1
+        self.w, self.phi = self.initialize_weights(dim_x, args, init_true = init_true, train_w = train_w, betas = betas)
 
-        
 
         opt = torch.optim.Adam([self.phi], lr=args["lr"])
         loss = torch.nn.MSELoss()
@@ -131,44 +121,29 @@ class InvariantRiskMinimization(object):
         Id =  torch.eye(dim_x, dim_x)
 
         for iteration in range(args["n_iterations"]):
-            error = 0
+            err = 0
 
             for beta_e in betas:
                 
                 M = (Id + reg* torch.inverse(self.phi.T @ self.phi))
-                error += ((beta_e - self.phi @ self.w).T @ M @ (beta_e - self.phi @ self.w) )
-                if (M!=M).sum() > 0:
-                    print(M!= M)
-                    print("inv", torch.inverse(self.phi.T @ self.phi))
-                    print("M", M)
-                    assert 1 == 0
+                err += ((beta_e - self.phi @ self.w).T @ M @ (beta_e - self.phi @ self.w) )
+                
             opt.zero_grad()
-            err = error
-            err.backward()
-            opt.step()
+            w_str = pretty(self.solution())
+            summary = "{:05d} | {:.5f} | {:.5f} |  {}".format(iteration, reg, err.item(), w_str)
 
-            if args["verbose"] and iteration % 10000 == 0:
-                w_str = pretty(self.solution())
-                print("{:05d} | {:.5f} | {:.5f} |  {}".format(iteration,
-                                                                      reg,
-                                                                      error.item(),
-                                                                      w_str))
-
+            self.make_optimization_step(err, opt, iteration, args, summary)
             early_stopping(err.item())
         
             if early_stopping.early_stop:
                 print("Early stopping at %d"%iteration)
-
                 break
         return err
 
-    def train_popul(self, betas, args, reg=0, patience=10):
+    def train_popul_transformed_reg(self, betas, args, reg=0, patience=8, init_true = 0):
         dim_x = betas[0].size(0)
 
-        self.phi = torch.nn.Parameter(torch.eye(dim_x, dim_x))
-         
-        self.w = torch.ones(dim_x, 1)
-        self.w.requires_grad = True
+        self.w, self.phi = self.initialize_weights(dim_x, args, init_true = init_true, train_w = False, betas= betas)
 
         opt = torch.optim.Adam([self.phi], lr=args["lr"])
         loss = torch.nn.MSELoss()
@@ -183,40 +158,31 @@ class InvariantRiskMinimization(object):
                 error += loss(self.phi @ self.w, beta_e)
                 penalty += (  self.phi.T @ (beta_e - self.phi @ self.w) ).pow(2).mean()
 
-            opt.zero_grad()
             if args["setup_sem"] == "irm_popul":
                 err = error + reg * penalty
             else:
                 err = reg * error + (1 - reg) * penalty
-            #
-            err.backward()
-            opt.step()
-
-            if args["verbose"] and iteration % 10000 == 0:
-                w_str = pretty(self.solution())
-                print("{:05d} | {:.5f} | {:.5f} | {:.5f} | {}".format(iteration,
-                                                                      reg,
-                                                                      error,
-                                                                      penalty,
-                                                                      w_str))
-
+            
+            w_str = pretty(self.solution())
+            summary = "{:05d} | {:.5f} | {:.5f} | {:.5f} | {}".format(iteration, reg, error, penalty,
+                                                                      w_str)
+            self.make_optimization_step(err, opt, iteration, args, summary)
             early_stopping(err.item())
         
             if early_stopping.early_stop:
                 print("Early stopping at %d"%iteration)
-
                 break
         return err
 
-    def train(self, environments, args, reg=0):
+    def train_transformed_reg(self, environments, args, reg=0, patience = 8):
         dim_x = environments[0][0].size(1)
 
-        self.phi = torch.nn.Parameter(torch.eye(dim_x, dim_x))
-        self.w = torch.ones(dim_x, 1)
-        self.w.requires_grad = True
+        self.w, self.phi = self.initialize_weights(dim_x, args, init_true = 0, train_w = False)
 
         opt = torch.optim.Adam([self.phi], lr=args["lr"])
         loss = torch.nn.MSELoss()
+        early_stopping = EarlyStopping(patience=patience)
+
         for iteration in range(args["n_iterations"]):
             penalty = 0
             error = 0
@@ -226,18 +192,52 @@ class InvariantRiskMinimization(object):
                                 create_graph=True)[0].pow(2).mean()
                 error += error_e
 
-            opt.zero_grad()
-            (reg * error + (1 - reg) * penalty).backward()
-            opt.step()
+            err = (reg * error + (1 - reg) * penalty)
+            w_str = pretty(self.solution())
+            summary = "{:05d} | {:.5f} | {:.5f} | {:.5f} | {}".format(iteration, reg, error, penalty,
+                                                                      w_str)
+            self.make_optimization_step(err, opt, iteration, args, summary)
+            early_stopping(err.item())
 
-            if args["verbose"] and iteration % 10000 == 0:
-                w_str = pretty(self.solution())
-                print("{:05d} | {:.5f} | {:.5f} | {:.5f} | {}".format(iteration,
-                                                                      reg,
-                                                                      error,
-                                                                      penalty,
-                                                                      w_str))
-        #print("w", self.w.data.numpy())
+            if early_stopping.early_stop:
+                print("Early stopping at %d"%iteration)
+                break
+
+    def initialize_weights(self, dim_x, args, init_true = 0, betas = None, train_w= False):
+
+        if init_true == 1:
+            # initialize parameters to true ones (ERM)
+            phi = torch.nn.Parameter(torch.diag(torch.mean(torch.stack(betas),dim=0).squeeze()))
+            if train_w:
+                # train parameters w
+                w = torch.nn.Parameter(torch.ones(dim_x, 1))
+            else:
+                # set parameters w = 1 and fix them 
+                w = torch.ones(dim_x, 1)
+                w.requires_grad = True
+        else:
+            # randomly initialize parameters Phi
+            phi = torch.nn.Parameter(torch.randn(dim_x, dim_x))
+            if train_w:
+                w = torch.nn.Parameter(torch.randn(dim_x, 1))
+            else:
+                w = torch.randn(dim_x, 1)
+                w.requires_grad = True
+
+        print("init_w: train_w = ", train_w, " init_Phi: init_true = ", init_true==1)
+        return w, phi
+
+    def make_optimization_step(self, err, opt, iteration, args, summary):
+        opt.zero_grad()
+        err.backward()
+        opt.step()
+
+        if args["verbose"] and iteration % 10000 == 0:
+            print(summary)
+
+
+
+
 
     def solution(self):
         return (self.phi @ self.w).view(-1, 1)
@@ -245,8 +245,9 @@ class InvariantRiskMinimization(object):
 
 class InvariantCausalPrediction(object):
     def __init__(self, environments, args, orders=None):
+
         def get_pvalue(subset, x_all, y_all, e_all):
-            # null hypothesis = S is causal
+            # null hypothesis   H0: S is causal
             x_s = x_all[:, subset]
             reg = LinearRegression(fit_intercept=False).fit(x_s, y_all)
 
@@ -289,17 +290,30 @@ class InvariantCausalPrediction(object):
             p_value = get_pvalue(subset, x_all, y_all, e_all)
 
             if p_value > self.alpha:
-                if args["cond_in"]!= 'n':
+                # keep null hypothesis => S is causal
+                if args["cond_in"] == 'n':
+                    # no conditional independence
+                    # accept the set S using original ICP test
+                    # without conditional independence term
+                    accepted_subsets.append(set(subset))
+                    L = []
+                    for e in range(len(orders)):
+                        L += [set(subset).intersection(orders[e])]
+                    if args["verbose"]:
+                        print("Accepted subset:", subset, "L", L, "p_value:", p_value)
+                else:
+                    # enforce CI (conditional independence)
                     # do regression for the residual variables: S^c
-                    # if for all j \in S^c are not causal = accept S
-                    # otw reject S
-                    # causal when the resilduals are
+                    #       if for all j \in S^c are not causal => accept S
+                    #       otw reject S
+                    # j is causal when the residuals are similar
+
                     x_s = x_all[:, subset]
                     reg = LinearRegression(fit_intercept=False).fit(x_s, y_all)
 
                     y_S = (y_all - reg.predict(x_s)).ravel()
 
-
+                    # S^c = {j: j \notin S}
                     js = omega_set - set(subset)
 
                     exists_causal_j = False
@@ -309,37 +323,106 @@ class InvariantCausalPrediction(object):
                         x_j =  x_all[:, j:j+1]
                         flag = False # flag == False only if j in S^c is causal  
                         if args["cond_in"] == 'eq_abs':
+                            # check if gamma_e 's are close to each other
+                            # if |gamma_1 - gamma_2| small
                             for e in range(len(environments)):
                                 e_idx = np.where(e_all == e)[0]
                                 reg_je = LinearRegression().fit(x_j[e_idx, :], y_S[e_idx])
                                 gamma_e = reg_je.coef_[0]
-                                # check if gamma_e 's are close to each other
                                 for gamma in gammas:
                                     if np.abs(gamma-gamma_e) > 1e-1:
-                                        flag = True
-                                
+                                        flag = True                                
                                 gammas += [gamma_e]
 
-                        elif args["cond_in"] == 'eq_conf':
+                        elif args["cond_in"] == 'eq_conf_delta':
+                            # regression coefficient for x_j: gamma is 1D
+                            # get confidence interval for gamma_ek and combine it with c.i. of gamma_em, 
+                            # i.e. (gamma_1 - gamma_2) +/- delta
+                            # if |gamma_1 - gamma_2| > 2*delta  ==>  gamma_1 != gamma_2
                             for e in range(len(environments)):
                                 e_idx = np.where(e_all == e)[0]
                                 res = sm.OLS(endog=y_S[e_idx], exog=x_j[e_idx, :]).fit()
-                                # gamma is 1D
-                                # get confidence interval for gamma_ek and combine it with c.i. of gamma_em, 
-                                # i.e. (gamma_1 - gamma_2) +/- delta
-                                # if |gamma_1 - gamma_2| > 2*delta  ==>  gamma_1 != gamma_2
+                                # student t distribution
+                                #ci_gamma_e = res.conf_int(0.05/len(environments)).squeeze()
                                 ci_gamma_e = res.conf_int(0.05).squeeze()
                                 gamma_e = np.mean(ci_gamma_e)
-                                delta_e = ci_gamma_e[1] - gamma_e
+                                # variance
+                                delta_e = (ci_gamma_e[1] - gamma_e)
                                 
                                 for (gamma_ej, delta_ej) in gammas:
-
                                     delta = np.sqrt(delta_e**2 + delta_ej**2)
+                                    # correction for the number ofg environments
                                     if np.abs(gamma_e - gamma_ej) > 2*delta:
                                         # outside of confidence interval
-                                        flag = True
-                                
+                                        flag = True                                
                                 gammas += [(gamma_e, delta_e)]
+
+                        elif args["cond_in"] == 'eq_conf':
+                            # regression coefficient for x_j: gamma is 1D
+                            # get confidence interval for gamma_ek and combine it with c.i. of gamma_em, 
+                            # i.e. (gamma_1 - gamma_2) +/- delta
+                            # if |gamma_1 - gamma_2| > 2*delta  ==>  gamma_1 != gamma_2
+                            for e in range(len(environments)):
+                                e_idx = np.where(e_all == e)[0]
+                                X = sm.add_constant(x_j[e_idx, :])
+                                res = sm.OLS(endog=y_S[e_idx], exog=X).fit()
+                                # student t distribution
+                                b0, b1 = res.params[0], res.params[1] 
+                                N = y_S[e_idx].shape[0]
+                                p = 2
+
+                                residuals = np.expand_dims(y_S[e_idx], axis=1) - b0 - b1*x_j[e_idx, :]
+                                sigma2_hat = (1./(N - p - 1)*np.dot(residuals.T, residuals)).squeeze()
+                                var_b1 = sigma2_hat * np.linalg.inv(np.dot(x_j[e_idx, :].T, x_j[e_idx, :]))
+                                var_e = np.sqrt(var_b1/ N).squeeze()
+
+                                gamma_e = res.params[-1]
+
+                                
+                                for (gamma_ej, var_ej) in gammas:
+                                    std = np.sqrt((var_e + var_ej)/N)
+                                    # correction for the number of environments
+                                    tval = scipy.stats.t.ppf(1-args["alpha"]/len(environments), N-1)
+                                    if np.abs(gamma_e - gamma_ej) / std > tval:
+                                        # gammas are different
+                                        flag = True                                
+                                gammas += [(gamma_e, var_e)]
+
+                        elif args["cond_in"] == 'eq_chi_var':
+                            # gamma is 1D
+                            # get p value for chi^2(m-1) distribution 
+                            # if p < alpha  ==>  gamma_1 != ... != gamma_m
+                            gammas = []
+                            var_e = []
+                            for e in range(len(environments)):
+                                e_idx = np.where(e_all == e)[0]
+
+                                X = sm.add_constant(x_j[e_idx, :])
+                                res = sm.OLS(endog=y_S[e_idx], exog=X).fit()
+                                # student t distribution
+                                b0, b1 = res.params[0], res.params[1] 
+                                N = y_S[e_idx].shape[0]
+                                p = 2
+                                gamma_e = res.params[-1]
+                                residuals = np.expand_dims(y_S[e_idx], axis=1) - b0 -  b1*x_j[e_idx, :]
+                                sigma2_hat = (1./(N - p - 1)*np.dot(residuals.T, residuals)).squeeze()
+                                var_b1 = (sigma2_hat * np.linalg.inv(np.dot(x_j[e_idx, :].T, x_j[e_idx, :]))).squeeze()
+
+                                var_e += [var_b1]                                
+                                gammas += [gamma_e]
+
+                            gammas = np.array(gammas)
+                            var_e = np.array(var_e)
+                            k = gammas.shape[0]
+                            gamma_bar = np.ones(k)*gammas.mean()
+                            #Chi2 test
+                            val = (np.divide((gammas - gamma_bar)**2, var_e)).sum()
+                            p_val = 1 - chi2.cdf(val, k-1)
+                            #print("chi p_val = ", p_val, val,"S=", subset,"j=", j ) #val, )
+
+                            if p_val < self.alpha:
+                                # outside of confidence interval
+                                flag = True
 
                         elif args["cond_in"] == 'eq_chi':
                             # gamma is 1D
@@ -349,20 +432,18 @@ class InvariantCausalPrediction(object):
                             var_e = []
                             for e in range(len(environments)):
                                 e_idx = np.where(e_all == e)[0]
-                                #reg_je = LinearRegression().fit(x_j[e_idx, :], y_S[e_idx])
-                                #gamma_e = reg_je.coef_[0]
+                                #reg_je = LinearRegression().fit(x_j[e_idx, :], y_S[e_idx]); gamma_e = reg_je.coef_[0]
                                 res = sm.OLS(endog=y_S[e_idx], exog=x_j[e_idx, :]).fit()
                                 ci_gamma_e = res.conf_int(0.05).squeeze()
                                 gamma_e = np.mean(ci_gamma_e)
-                                var_e = ((ci_gamma_e[1] - ci_gamma_e[0])/4.)**2
-                                
+                                var_e += [((ci_gamma_e[1] - ci_gamma_e[0])/4.)**2]                                
                                 gammas += [gamma_e]
 
                             gammas = np.array(gammas)
                             var_e = np.array(var_e)
                             k = gammas.shape[0]
                             gamma_bar = np.ones(k)*gammas.mean()
-                            #val2, p_val = chisquare(gammas, f_exp=gamma_bar, ddof=0)
+                            #Chi2 test
                             val = (np.divide((gammas - gamma_bar)**2, var_e)).sum()
                             p_val = 1 - chi2.cdf(val, k-1)
                             #print("chi p_val = ", p_val, val,"S=", subset,"j=", j ) #val, )
@@ -372,9 +453,10 @@ class InvariantCausalPrediction(object):
                                 flag = True
 
                         elif args["cond_in"] == 'pval':
-                            p_value_j = get_pvalue([j], x_all, y_S, e_all)
-                            # if [j] is causal => null hypothesis is not rejected
+                            p_value_j = get_pvalue([j], x_all, y_S, e_all)/len(environments)
+                            # if null hypothesis => [j] is causal
                             if p_value_j < self.alpha:
+                                # j is not causal
                                 flag = True
 
                         if flag == False:
@@ -387,14 +469,6 @@ class InvariantCausalPrediction(object):
                         accepted_subsets.append(set(subset))
                         if args["verbose"]:
                                 print("Accepted subset:", subset, "p_value:", p_value)
-
-                else:
-                    accepted_subsets.append(set(subset))
-                    L = []
-                    for e in range(len(orders)):
-                        L += [set(subset).intersection(orders[e])]
-                    if args["verbose"]:
-                                print("Accepted subset:", subset, "L", L, "p_value:", p_value)
 
             else:
                 if args["verbose"]:
