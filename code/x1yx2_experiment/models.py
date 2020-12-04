@@ -45,6 +45,22 @@ class EarlyStopping(object):
             self.past = err
 
 
+class BestParameters(object):
+    def __init__(self):
+        self.past = None
+        self.params = []
+
+    def __call__(self, err, params):
+        if self.past != None:
+            if err < self.past:
+                self.params = [par.clone() in params]
+                self.past = err
+        else:
+            self.params = [par.clone() in params]
+            self.past = err
+
+
+
 
 def pretty(vector):
     vlist = vector.view(-1).tolist()
@@ -70,23 +86,27 @@ class InvariantRiskMinimization(object):
             if args["setup_sem"] == "irm_popul":
                 regs = [10.]
             else:
-                regs = [1e-5, 1e-4, 1e-3, 1e-2, 1e-1]
+                regs = [1e-4, 0.025]
         else:
             regs = [0, 1e-5, 1e-4, 1e-3, 1e-2, 1e-1]
 
+        all_grads = {}
+        eps = 1e-04
         for reg in regs:
             if population:
                 # population risk minimization
                 if orig_risk == False:
                     # optimize loss with transformed regularization term
-                    err = self.train_popul_transformed_reg(betas, args, reg=reg, init_true=args["phi_init"]).item()
+                    err = self.train_popul_transformed_reg(betas, args, reg=reg, init_true=args["phi_init"], eps=eps).item()
                 elif orig_risk == True :
                     # optimize loss with original regularization term
-                    err = self.train_popul_orig_reg(betas, args, reg=reg, init_true=args["phi_init"]).item()
+                    err, grads = self.train_popul_orig_reg(betas, args, reg=reg, init_true=args["phi_init"], eps=eps).item()
             else:
                 # empricial risk minimization
-                self.train_transformed_reg(environments[:-1], args, reg=reg)
+                grads = self.train_transformed_reg(environments[:-1], args, reg=reg, patience=10**1, eps=eps)
                 err = (x_val @ self.solution() - y_val).pow(2).mean().item()
+
+            all_grads[reg] = grads
 
             if args["verbose"]:
                 print("IRM (reg={:.5f}) has {:.3f} validation error.".format(
@@ -106,8 +126,9 @@ class InvariantRiskMinimization(object):
         self.w = best_w
         self.reg = best_reg
         self.beta = self.phi @ self.w
+        self.all_grads = all_grads
 
-    def train_popul_orig_reg(self, betas, args, reg=0, patience=8, init_true=0):
+    def train_popul_orig_reg(self, betas, args, reg=0, patience=15, init_true=0, eps=1e-05):
         dim_x = betas[0].size(0)
 
         train_w = args["train_w"] == 1
@@ -120,12 +141,18 @@ class InvariantRiskMinimization(object):
         early_stopping = EarlyStopping(patience=patience)
         Id =  torch.eye(dim_x, dim_x)
 
+        grads = []
+        watch = BestParameters()
+
         for iteration in range(args["n_iterations"]):
             err = 0
 
             for beta_e in betas:
                 
-                M = (Id + reg* torch.inverse(self.phi.T @ self.phi))
+                #M = (Id + reg* torch.inverse(self.phi.T @ self.phi))
+                invPhi = torch.inverse(self.phi.T @ self.phi)
+                PhiD = invPhi @ self.phi.T
+                M = (Id + reg * (PhiD.T @ PhiD))
                 err += ((beta_e - self.phi @ self.w).T @ M @ (beta_e - self.phi @ self.w) )
                 
             opt.zero_grad()
@@ -134,13 +161,26 @@ class InvariantRiskMinimization(object):
 
             self.make_optimization_step(err, opt, iteration, args, summary)
             early_stopping(err.item())
-        
-            if early_stopping.early_stop:
+
+            gr = torch.norm(self.phi.grad.view(-1))
+            if args["train_w"] == 1:
+                gr += torch.norm(self.w.grad.view(-1))
+            if iteration % args["grad_freq"] == 0:
+                grads += [ gr.item()]
+
+            watch(gr, params)
+
+            if gr < eps: # or early_stopping.early_stop 
                 print("Early stopping at %d"%iteration)
                 break
-        return err
 
-    def train_popul_transformed_reg(self, betas, args, reg=0, patience=8, init_true = 0):
+        print("iteration = ", iteration, "gradient = ", watch.past)
+        self.phi = watch.params[0].clone()
+        if args["train_w"] == 1:
+            self.w = watch.params[1].clone()
+        return grads
+
+    def train_popul_transformed_reg(self, betas, args, reg=0, patience=15, init_true = 0, eps=1e-05):
         dim_x = betas[0].size(0)
 
         self.w, self.phi = self.initialize_weights(dim_x, args, init_true = init_true, train_w = False, betas= betas)
@@ -149,6 +189,8 @@ class InvariantRiskMinimization(object):
         loss = torch.nn.MSELoss()
 
         early_stopping = EarlyStopping(patience=patience)
+        grads = []
+        watch = BestParameters()
 
         for iteration in range(args["n_iterations"]):
             penalty = 0
@@ -156,7 +198,7 @@ class InvariantRiskMinimization(object):
 
             for beta_e in betas:
                 error += loss(self.phi @ self.w, beta_e)
-                penalty += (  self.phi.T @ (beta_e - self.phi @ self.w) ).pow(2).mean()
+                penalty += 4*(self.phi.T @ (beta_e - self.phi @ self.w) ).pow(2).sum()#.mean()
 
             if args["setup_sem"] == "irm_popul":
                 err = error + reg * penalty
@@ -168,13 +210,26 @@ class InvariantRiskMinimization(object):
                                                                       w_str)
             self.make_optimization_step(err, opt, iteration, args, summary)
             early_stopping(err.item())
-        
-            if early_stopping.early_stop:
+
+            gr = torch.norm(self.phi.grad.view(-1))
+            if args["train_w"] == 1:
+                gr += torch.norm(self.w.grad.view(-1))
+            if iteration % args["grad_freq"] == 0:
+                grads += [ gr.item()]
+
+            watch(gr, params)
+
+            if gr < eps: # or early_stopping.early_stop 
                 print("Early stopping at %d"%iteration)
                 break
-        return err
 
-    def train_transformed_reg(self, environments, args, reg=0, patience = 8):
+        print("iteration = ", iteration, "gradient = ", watch.past)
+        self.phi = watch.params[0].clone()
+        if args["train_w"] == 1:
+            self.w = watch.params[1].clone()
+        return grads
+
+    def train_transformed_reg(self, environments, args, reg=0, patience = 15, eps = 1e-05):
         dim_x = environments[0][0].size(1)
 
         self.w, self.phi = self.initialize_weights(dim_x, args, init_true = 0, train_w = False)
@@ -182,6 +237,8 @@ class InvariantRiskMinimization(object):
         opt = torch.optim.Adam([self.phi], lr=args["lr"])
         loss = torch.nn.MSELoss()
         early_stopping = EarlyStopping(patience=patience)
+        grads = []
+        watch = BestParameters()
 
         for iteration in range(args["n_iterations"]):
             penalty = 0
@@ -189,7 +246,7 @@ class InvariantRiskMinimization(object):
             for x_e, y_e in environments:
                 error_e = loss(x_e @ self.phi @ self.w, y_e)
                 penalty += grad(error_e, self.w,
-                                create_graph=True)[0].pow(2).mean()
+                                create_graph=True)[0].pow(2).sum()#.mean()
                 error += error_e
 
             err = (reg * error + (1 - reg) * penalty)
@@ -199,9 +256,25 @@ class InvariantRiskMinimization(object):
             self.make_optimization_step(err, opt, iteration, args, summary)
             early_stopping(err.item())
 
-            if early_stopping.early_stop:
+            gr = torch.norm(self.phi.grad.view(-1))
+            params = [self.phi]
+            if args["train_w"] == 1:
+                gr += torch.norm(self.w.grad.view(-1))
+                params += [self.w]
+            if iteration % args["grad_freq"] == 0:
+                grads += [ gr.item()]
+
+            watch(gr, params)
+
+            if gr < eps: # or early_stopping.early_stop 
                 print("Early stopping at %d"%iteration)
                 break
+
+        print("iteration = ", iteration, "gradient = ", watch.past)
+        self.phi = watch.params[0].clone()
+        if args["train_w"] == 1:
+            self.w = watch.params[1].clone()
+        return grads
 
     def initialize_weights(self, dim_x, args, init_true = 0, betas = None, train_w= False):
 
@@ -244,6 +317,18 @@ class InvariantRiskMinimization(object):
 
 
 class InvariantCausalPrediction(object):
+
+    def mean_var_test(self, x, y):
+        pvalue_mean = ttest_ind(x, y, equal_var=False).pvalue
+        pvalue_var1 = 1 - fdist.cdf(np.var(x, ddof=1) / np.var(y, ddof=1),
+                                    x.shape[0] - 1,
+                                    y.shape[0] - 1)
+
+        pvalue_var2 = 2 * min(pvalue_var1, 1 - pvalue_var1)
+
+        return 2 * min(pvalue_mean, pvalue_var2)
+
+
     def __init__(self, environments, args, orders=None):
 
         def get_pvalue(subset, x_all, y_all, e_all):
@@ -259,6 +344,7 @@ class InvariantCausalPrediction(object):
                 res_in = (y_all[e_in] - reg.predict(x_s[e_in, :])).ravel()
                 res_out = (y_all[e_out] - reg.predict(x_s[e_out, :])).ravel()
 
+                # probability that res_in and res_out have same distribution
                 p_values.append(self.mean_var_test(res_in, res_out))
 
             # TODO: Jonas uses "min(p_values) * len(environments) - 1"
@@ -342,9 +428,9 @@ class InvariantCausalPrediction(object):
                             for e in range(len(environments)):
                                 e_idx = np.where(e_all == e)[0]
                                 res = sm.OLS(endog=y_S[e_idx], exog=x_j[e_idx, :]).fit()
-                                # student t distribution
-                                #ci_gamma_e = res.conf_int(0.05/len(environments)).squeeze()
-                                ci_gamma_e = res.conf_int(0.05).squeeze()
+                                # student t distribution; one std from mean
+                                ci_gamma_e = res.conf_int(0.318/len(environments)).squeeze()
+                                #ci_gamma_e = res.conf_int(0.318).squeeze()
                                 gamma_e = np.mean(ci_gamma_e)
                                 # variance
                                 delta_e = (ci_gamma_e[1] - gamma_e)
@@ -357,7 +443,7 @@ class InvariantCausalPrediction(object):
                                         flag = True                                
                                 gammas += [(gamma_e, delta_e)]
 
-                        elif args["cond_in"] == 'eq_conf':
+                        elif args["cond_in"] == 'eq_conf_var':
                             # regression coefficient for x_j: gamma is 1D
                             # get confidence interval for gamma_ek and combine it with c.i. of gamma_em, 
                             # i.e. (gamma_1 - gamma_2) +/- delta
@@ -383,6 +469,7 @@ class InvariantCausalPrediction(object):
                                     std = np.sqrt((var_e + var_ej)/N)
                                     # correction for the number of environments
                                     tval = scipy.stats.t.ppf(1-args["alpha"]/len(environments), N-1)
+                                    tval = scipy.stats.t.ppf(1-args["alpha"], N-1)
                                     if np.abs(gamma_e - gamma_ej) / std > tval:
                                         # gammas are different
                                         flag = True                                
@@ -490,15 +577,6 @@ class InvariantCausalPrediction(object):
         else:
             self.coefficients = torch.zeros(dim)
 
-    def mean_var_test(self, x, y):
-        pvalue_mean = ttest_ind(x, y, equal_var=False).pvalue
-        pvalue_var1 = 1 - fdist.cdf(np.var(x, ddof=1) / np.var(y, ddof=1),
-                                    x.shape[0] - 1,
-                                    y.shape[0] - 1)
-
-        pvalue_var2 = 2 * min(pvalue_var1, 1 - pvalue_var1)
-
-        return 2 * min(pvalue_mean, pvalue_var2)
 
     def powerset(self, s):
         return chain.from_iterable(combinations(s, r) for r in range(len(s) + 1))

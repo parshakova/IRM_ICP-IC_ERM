@@ -57,7 +57,6 @@ class SEM_X1YX2X3(object):
         def shuffle_columns(x, dim):
             reorder_cols = list(range(dim))
             random.shuffle(reorder_cols)
-            print("environment", reorder_cols)
             idx = torch.repeat_interleave(torch.tensor(reorder_cols).view(1,-1), n, dim=0)
             return torch.gather(x, 1, idx), reorder_cols
 
@@ -81,7 +80,7 @@ class SEM_X1YX2X3(object):
             x23, reorder_cols = shuffle_columns(x23, x23.numpy().shape[1])
         envs_order = list(range(self.k)) 
         for i, val in  enumerate(reorder_cols):
-            if val in range(self.k):
+            if val < self.k:
                 envs_order += [i+self.k]
         xs = torch.cat((x1, x23), 1)
         print("envs order ", envs_order, reorder_cols)

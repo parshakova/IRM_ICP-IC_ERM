@@ -48,7 +48,7 @@ def setup_models_environments(args):
         torch.manual_seed(args["seed"])
         numpy.random.seed(args["seed"])
         torch.set_num_threads(1)
-        random.seed(1)
+        random.seed(args["seed"])
 
     if args["setup_sem"] == "chain":
         setup_str = "chain_ones={}_hidden={}_hetero={}_scramble={}".format(
@@ -64,18 +64,27 @@ def setup_models_environments(args):
             "ICP": InvariantCausalPrediction,
             "IRM": InvariantRiskMinimization
     }
-    if  args["setup_sem"] != "simple": 
+    if  args["method_reg"] != "all": 
         del all_methods["ICP"]
     
 
     all_sems = []
-    betas = []
+    betas = []; env_orders = []
     all_environments = []
     n_env = int(args["env_list"])
 
+    if args["setup_sem"] == "chain":
+        sem = ChainEquationModel(args["dim"], ones=args["setup_ones"], hidden=args["setup_hidden"], scramble=args["setup_scramble"], hetero=args["setup_hetero"])
+    elif args["setup_sem"] == "causal":
+
+        sem = SEM_X1YX2X3(args["dim"],args["k"], args["env_shuffle"])
+    elif args["setup_sem"] == "indep":
+        sem = IRM_ERM_SimpleEnvs(args["dim"])
+
+    print("SEM type: ", args["setup_sem"])
+    
     for rep_i in range(args["n_reps"]):
-        if args["setup_sem"] == "irm_popul":
-            sem = IRM_ERM_SimpleEnvs(args["dim"])
+        if args["method_reg"] in ["irm_popul", "irm_erm_popul", "irm_erm_nsample"]:
             env_list = range(n_env)
             # ratios are forced to be the same
             n = args["n_samples"]
@@ -87,44 +96,11 @@ def setup_models_environments(args):
                 environments += [res[:2]]
                 betas += [res[2]]
 
-        elif args["setup_sem"] == "irm_erm_popul":
-            sem = IRM_ERM_SimpleEnvs(args["dim"])
-            env_list = range(n_env)
-            # ratios are forced to be the same
-            n = args["n_samples"]
-            print("sample in each envs ", n)
-            environments = []
-            betas = []
-            for e in env_list:
-                res = sem(n, e)
-                environments += [res[:2]]
-                betas += [res[2]]
-
-        elif args["setup_sem"] == "irm_erm_simple":
-            sem = IRM_ERM_SimpleEnvs(args["dim"])
-            env_list = range(n_env)
-            # ratios are forced to be the same
-            n = args["n_samples"]
-            print("sample in each envs ", n)
-            environments = []
-            betas = []
-            for e in env_list:
-                res = sem(n, e)
-                environments += [res[:2]]
-                betas += [res[2]]
-
-        elif args["setup_sem"] == "chain":
-            sem = ChainEquationModel(args["dim"],
-                                     ones=args["setup_ones"],
-                                     hidden=args["setup_hidden"],
-                                     scramble=args["setup_scramble"],
-                                     hetero=args["setup_hetero"])
-
+        elif args["method_reg"] == "chain":
             env_list = [float(e) for e in args["env_list"].split(",")]
             environments = [sem(args["n_samples"], e) for e in env_list]
 
-        elif args["setup_sem"] == "simple":
-            sem = SEM_X1YX2X3(args["dim"],args["k"], args["env_shuffle"])
+        elif args["method_reg"] == "all":
 
             env_list = range(int(args["env_list"]))
             ratios = list(map(int, args["env_rat"].split(':')))
@@ -143,15 +119,15 @@ def setup_models_environments(args):
         all_sems.append(sem)
         all_environments.append(environments)
 
-    return all_sems, all_environments, setup_str, betas, all_methods
+    return all_sems, all_environments, setup_str, betas, all_methods, env_orders
 
 
 
-# args["setup_sem"] == "simple"
+# args["method_reg"] == "all"
 def solve_irm_erm_icp(args):
 
     all_solutions = []
-    all_sems, all_environments, setup_str, _, methods = setup_models_environments(args)
+    all_sems, all_environments, setup_str, _, methods, env_orders = setup_models_environments(args)
 
     sol_dict = {}
     for sem, environments in zip(all_sems, all_environments):
@@ -179,6 +155,9 @@ def solve_irm_erm_icp(args):
 
             sol_dict[method_name] = [method_solution.detach().view(-1).numpy(), \
                                                 ecaus.detach().view(-1).numpy(), enoncaus.detach().view(-1).numpy()]
+            if method_name == "IRM":
+                sol_dict["IRM_grad"] = [method.all_grads]
+            
 
         all_solutions += solutions
 
@@ -190,16 +169,16 @@ def compute_u_rhs(u, betas, lamb, eta):
         a = 0; b = 0
         for beta_e in betas:
             dot_prod = torch.matmul(u.T, beta_e - u).squeeze()
-            a += (eta-lamb*dot_prod)*beta_e
-            b += (eta-2*lamb*dot_prod)
+            a += (eta - lamb*dot_prod)*beta_e
+            b += (eta - 2*lamb*dot_prod)
         res = a / b
         return res
 
-# args["setup_sem"] == "irm_erm_simple"
+# args["method_reg"] == "irm_erm_nsample"
 def solve_irm2_erm(args):
 
     n_env = int(args["env_list"])
-    all_sems, all_environments, setup_str, betas, methods = setup_models_environments(args)
+    all_sems, all_environments, setup_str, betas, methods, env_orders = setup_models_environments(args)
 
     sol_dict = {}
     p = args["dim"]
@@ -223,9 +202,10 @@ def solve_irm2_erm(args):
                     u = torch.matmul(phi, ones)
                     phi_ort = torch.matmul(phi, P_ort)
                     print("||Phi_ort|| = ", torch.norm(phi_ort))
-                    u_hat = compute_u_rhs(u, betas[1:], lamb=1-lamb, eta=lamb)
+                    u_hat = compute_u_rhs(u, betas[1:], lamb=(1-lamb)*4./args["dim"], eta=lamb)
                     print("||u-u_hat|| = ", torch.norm(u-u_hat))
                     sol_dict[method_name] += [(lamb, torch.norm(phi_ort), torch.norm(u-u_hat))]
+                sol_dict["IRM_grad"] = [method.all_grads]
 
             elif method_name == "ERM":
                 print("******** ERM *********")
@@ -237,11 +217,11 @@ def solve_irm2_erm(args):
     return sol_dict
 
 
-# args["setup_sem"] == "irm_erm_popul"
+# args["method_reg"] == "irm_erm_popul"
 def solve_irm2_erm_popul(args):
 
     n_env = int(args["env_list"])
-    all_sems, all_environments, setup_str, betas, methods = setup_models_environments(args)
+    all_sems, all_environments, setup_str, betas, methods, env_orders = setup_models_environments(args)
 
     sol_dict = {}
     p = args["dim"]
@@ -267,11 +247,12 @@ def solve_irm2_erm_popul(args):
                     phi_ort = torch.matmul(phi, P_ort)
                     print("||Phi_ort|| = ", torch.norm(phi_ort))
                     
-                    u_hat = compute_u_rhs(u, betas, lamb=1-reg, eta=reg)
+                    u_hat = compute_u_rhs(u, betas, lamb=(1-reg)*4./args["dim"], eta=reg)
                     print("||u-u_hat|| = ", torch.norm(u-u_hat))
                     sol_dict[method_name] += [(reg, torch.norm(phi_ort), torch.norm(u-u_hat))]
 
                 beta_irm = method.beta
+                sol_dict["IRM_grad"] = [method.all_grads]
 
 
             elif method_name == "ERM":
@@ -282,11 +263,11 @@ def solve_irm2_erm_popul(args):
     return sol_dict
 
 
-# args["setup_sem"] == "irm_popul"
+# args["method_reg"] == "irm_popul"
 def solve_irm1_irm2_popul(args):
 
     n_env = int(args["env_list"])
-    all_sems, all_environments, setup_str, betas, methods = setup_models_environments(args)
+    all_sems, all_environments, setup_str, betas, methods, env_orders = setup_models_environments(args)
 
     p = args["dim"]
 
@@ -329,6 +310,7 @@ def plot_irm_erm_icp(sol_dict, ns, dim, args):
     """
     sol_dict[n][method_name] = [beta, err_causal, err_noncausal]
     method_name in {IRM, ICP, ERM} 
+    sol_dict[n][IRM] = [beta, err_causal, err_noncausal, all_grads]
     """
     method_names = ["ERM", "ICP", "IRM"]
 
@@ -377,6 +359,24 @@ def plot_irm_erm_icp(sol_dict, ns, dim, args):
 
 
     #plt.savefig('plot_caus_noncaus%s.png'%args["env_rat"])
+    plt.show()
+
+    if args["plot_grad"] == 1:
+        plot_grads_irm("n", sol_dict, ns, args)
+    
+
+def plot_grads_irm(name, sol_dict, ns, args):
+
+    fig, axs = plt.subplots(nrows=1, ncols=max(len(ns), 2)) 
+    for i,n in enumerate(ns):
+        for reg, grads in sol_dict[n]["IRM_grad"][-1].items():
+            axs[i].plot(args["grad_freq"]*np.array(range(len(grads))), grads, label  = "%.1e"%reg)
+        axs[i].set_title("%s=%d"%(name, n))
+        axs[i].set_yscale("log")
+        axs[i].set_ylabel("||grad||")
+        axs[i].set_xlabel("iter")
+        axs[i].legend(prop={'size': 6})
+
     plt.show()
 
 
@@ -430,14 +430,16 @@ def plot_envs(sol_dict, envs, dim, args):
             else:
                 axs[k,i].set_title('Nonc N = %d'%e)
 
-
     #plt.savefig('plot_caus_noncaus%s.png'%args["env_rat"])
     plt.show()
+
+    if args["plot_grad"] == 1:
+        plot_grads_irm("|E|", sol_dict, envs, args)
 
 
 def plot_irm_erm(sol_dict, ns):
     """
-    sol_dict[n][IRM] = [lamb, ||Phi_ort||, ||u-u_hat||]
+    sol_dict[n][IRM] = [lamb, ||Phi_ort||, ||u-u_hat||, {reg:||grad||}]
     sol_dict[n][ERM] = [||u-u_hat||]
     method_name in {IRM, ICP, ERM} 
     """
@@ -488,15 +490,17 @@ def plot_irm_erm(sol_dict, ns):
     axs[1].set_title("||Phi_ort||")
     axs[1].legend(prop={'size': 10})
 
-    #plt.savefig('irm_erm_curves.png')
     plt.show()
+
+    if args["plot_grad"] == 1:
+        plot_grads_irm("n", sol_dict, ns, args)
 
 
 def plot_irm_erm_popul(sol_dict, envs):
     """
     sol_dict[e][IRM] = [lamb, ||Phi_ort||, ||u-u_hat||]
     sol_dict[e][ERM] = [||u_irm - u_erm ||]
-    method_name in {IRM, ICP, ERM} 
+    method_name in {IRM, ERM} 
     """
     method_names = ["ERM", "IRM"]
     ncols = 3
@@ -546,157 +550,8 @@ def plot_irm_erm_popul(sol_dict, envs):
     plt.savefig('irm_erm_curves_dim%d.png'%args["dim"])
     plt.show()
 
-
-def plot_irm_popul_orig(sol_dict, envs):
-    """
-    sol_dict[e][seed][init] += [(reg, torch.norm(phi_ort), w_beta, torch.norm(w_beta - barycenter))]
-    method_name in {IRM} 
-    """
-    method = "IRM"
-    ncols = 3
-    fig, axs = plt.subplots(nrows=1, ncols=ncols, 
-                                    figsize=(5*ncols, 5))
-
-    width = 0.3
-    pos = [-1./2, 1./2]
-    ind = np.arange(len(envs))
-    phi_ort_norms = {}
-    seeds = [123, 222]
-    inits = [0, 1]
-    regs = []
-    xs = {}
-    
-    for el in sol_dict[envs[0]][seeds[0]][0]:
-        regs += [el[0]]
-    w_norms = {reg:{init:{} for init in inits} for reg in regs}
-
-    for seed in seeds:
-        for  init in inits:
-            if init == 1 and seed != seeds[0]:
-                continue
-            xs[str(seed)+"|"+str(init)] = {reg:[] for reg in regs}
-            phi_ort_norms[str(seed)+"|"+str(init)] = {reg:[] for reg in regs}
-            for e in envs:
-                for (reg, phi_norm, w_beta, w_norm) in sol_dict[e][seed][init]:
-                    xs[str(seed)+"|"+str(init)][reg] += [w_norm] 
-                    phi_ort_norms[str(seed)+"|"+str(init)][reg] += [phi_norm]
-                    if seed == seeds[0]:
-                        w_norms[reg][init][e] = w_beta.detach().numpy()
-            if init == 0:
-                linestyle = ":"
-            else:
-                linestyle = "-"
-            for reg in regs:
-                axs[0].plot(ind, xs[str(seed)+"|"+str(init)][reg], label = str(seed)+"|"+str(init)+"|%.1e"%reg, linestyle=linestyle)
-
-
-    axs[0].set_xticks(ind)
-    axs[0].set_xticklabels((str(e) for e in envs))
-    axs[0].legend(prop={'size': 8})
-    axs[0].set_title("||beta_irm - beta_mean||")
-
-    for seed in seeds:
-        for  init in inits:
-            if init == 1 and seed != seeds[0]:
-                continue
-            if init == 0:
-                linestyle = ":"
-            else:
-                linestyle = "-"
-            for reg in regs:
-                axs[1].plot(ind, phi_ort_norms[str(seed)+"|"+str(init)][reg], label  = str(seed)+"|"+str(init)+"|%.1e"%reg, linestyle=linestyle)
-    axs[1].set_xticks(ind)
-    axs[1].set_xticklabels((str(e) for e in envs))
-    axs[1].set_title("||Phi_ort||")
-    axs[1].legend(prop={'size': 8})
-
-    for reg in regs:
-        norms = []
-        for e in envs:
-            norms += [np.linalg.norm(w_norms[reg][0][e]-w_norms[reg][1][e])]
-        axs[2].plot(ind, norms, label  = "%.1e"%reg)
-    axs[2].set_xticks(ind)
-    axs[2].set_xticklabels((str(e) for e in envs))
-    axs[2].set_title("||beta_irm - beta_penal||")
-    axs[2].legend(prop={'size': 8})
-
-    plt.savefig('irm_curves_dim%d.png'%args["dim"])
-    plt.show()
-
-
-def plot_irm_popul(sol_dict, envs):
-    """
-    sol_dict[wphi][e][seed][init] = (reg, torch.norm(phi_ort), w_beta, torch.norm(w_beta - barycenter))
-    method_name in {IRM} 
-    compare IRM R(phi) with R(w,phi) optimization
-    """
-    method = "IRM"
-    ncols = 3
-    fig, axs = plt.subplots(nrows=1, ncols=ncols, 
-                                    figsize=(5*ncols, 5))
-
-    width = 0.3
-    pos = [-1./2, 1./2]
-    ind = np.arange(len(envs))
-    phi_ort_norms = {}
-    seeds = [123, 222]
-    inits = [0, 1]
-    regs = []
-    modes = ["wphi", "phi"]
-    
-    w_norms = {t:{init:{s:{} for s in seeds} for init in inits} for t in modes}
-
-    for seed in seeds:
-        for  init in inits:
-            if init == 1 and seed != seeds[0]:
-                continue
-
-            for wmode in modes:
-                if wmode == "phi" and init != 0:
-                    continue
-                xs = []
-                for e in envs:
-                    (reg, phi_norm, w_beta, w_norm) = sol_dict[wmode][e][seed][init]
-                    xs += [w_norm] 
-                    #phi_ort_norms[str(seed)+"|"+str(init)+"%s|"%wmode] = phi_norm
-                    w_norms[wmode][init][seed][e] = w_beta.detach().numpy()
-                if init == 0:
-                    linestyle = ":"
-                else:
-                    linestyle = "-"
-                axs[0].plot(ind, xs, label = "%s|"%wmode+str(seed)+"|"+str(init)+"|%.1e"%reg, linestyle=linestyle)
-
-
-
-    axs[0].set_xticks(ind)
-    axs[0].set_xticklabels((str(e) for e in envs))
-    axs[0].legend(prop={'size': 8})
-    axs[0].set_title("||beta_irm - beta_mean||")
-
-
-    for s in seeds:
-        norms = []
-        for e in envs:
-            norms += [np.linalg.norm(w_norms["phi"][0][s][e]-w_norms["wphi"][1][seeds[0]][e])]
-        axs[1].plot(ind, norms, label  = s)
-    axs[1].set_xticks(ind)
-    axs[1].set_xticklabels((str(e) for e in envs))
-    axs[1].set_title("||beta_irm - beta_penal_init||")
-    axs[1].legend(prop={'size': 8})
-
-    for s in seeds:
-        norms = []
-        for e in envs:
-            norms += [np.linalg.norm(w_norms["phi"][0][s][e]-w_norms["wphi"][0][s][e])]
-        axs[2].plot(ind, norms, label  = s)
-    axs[2].set_xticks(ind)
-    axs[2].set_xticklabels((str(e) for e in envs))
-    axs[2].set_title("||beta_irm - beta_penal||")
-    axs[2].legend(prop={'size': 8})
-
-
-    plt.savefig('irm_curves_dim%d_reg_1.png'%args["dim"])
-    #plt.show()
+    if args["plot_grad"] == 1:
+        plot_grads_irm("|E|", sol_dict, envs, args)
 
 
 def plot_irm1_irm2_popul(sol_dict, envs):
@@ -772,7 +627,8 @@ if __name__ == '__main__':
     parser.add_argument('--env_list', type=str, default="3")
     parser.add_argument('--env_rat', type=str, default="1:10:100", help="ratios of samples between environments")
     parser.add_argument('--env_shuffle', type=int, default=1)
-    parser.add_argument('--setup_sem', type=str, default="simple")
+    parser.add_argument('--setup_sem', type=str, default="causal", help = "<causal>, <indep>")
+    parser.add_argument('--method_reg', type=str, default="all", help = "<irm_popul>, <irm_erm_popul>, <irm_erm_simple>, <all>")
     parser.add_argument('--setup_ones', type=int, default=1)
     parser.add_argument('--phi_init', type=int, default=0)
     parser.add_argument('--setup_hidden', type=int, default=0)
@@ -780,14 +636,15 @@ if __name__ == '__main__':
     parser.add_argument('--train_w', type=int, default=0, help = "train parameters w or keep them fixed (w=1)")
     parser.add_argument('--setup_hetero', type=int, default=0)
     parser.add_argument('--setup_scramble', type=int, default=0)
+    parser.add_argument('--grad_freq', type=int, default=100, help="frequency for recording grad norm values of IRM")
+    parser.add_argument('--plot_grad', type=int, default=0, help = "plot gradient norms for IRM")
     args = dict(vars(parser.parse_args()))
     faulthandler.enable()
 
-    if args["setup_sem"] == "irm_popul":
+    if args["method_reg"] == "irm_popul":
         # IRM1: Optimize Phi, w
         # IRM2: Optimize Phi, w=1
-        # IRM1 vs IRM2 vs ERM 
-        # args["setup_sem"] == "irm_popul"       
+        # IRM1 vs IRM2 vs ERM       
         args["popul"] = 2
         n = 5000
         envs = [3, 5, 8, 10, 15]
@@ -800,9 +657,8 @@ if __name__ == '__main__':
         plot_irm1_irm2_popul(sol_dict, envs)
 
 
-    elif args["setup_sem"] == "irm_erm_popul":
+    elif args["method_reg"] == "irm_erm_popul":
         # IRM2 vs ERM population
-        # args["setup_sem"] == "irm_erm_popul"
         args["popul"] = 1
         sol_dict = {}
         n = 5000
@@ -816,9 +672,8 @@ if __name__ == '__main__':
         plot_irm_erm_popul(sol_dict, envs)
 
 
-    elif args["setup_sem"] == "irm_erm_simple":
+    elif args["method_reg"] == "irm_erm_nsample":
         # IRM2 vs ERM
-        # args["setup_sem"] == "irm_erm_simple"
         sol_dict = {}
         ns = [1000, 3000, 5000, 10000, 50000]
         for n in ns:
@@ -828,7 +683,7 @@ if __name__ == '__main__':
         plot_irm_erm(sol_dict, ns)
 
 
-    elif args["plot"]==1:
+    elif args["plot"]==1 and args["method_reg"] == "all":
         # plot IRM, ICP, ERM results subject to 
         # number of samples in each environment
         sol_dict = {}
@@ -842,7 +697,7 @@ if __name__ == '__main__':
         plot_irm_erm_icp(sol_dict, ns, args["dim"], args)
 
 
-    elif args["plot"]==2:
+    elif args["plot"]==2 and args["method_reg"] == "all":
         # plot IRM, ICP, ERM results subject to 
         # number of environments, while keeping fixed number of samples in each environment
         sol_dict = {}
@@ -860,9 +715,14 @@ if __name__ == '__main__':
             sol_dict[e] = n_sol_dict
         plot_envs(sol_dict, envs, args["dim"], args)
 
-    else:
-        all_solutions,_ = solve_irm_erm_icp(args)
+    elif args["method_reg"] == "all":
+        all_solutions, n_sol_dict = solve_irm_erm_icp(args)
         print("\n".join(all_solutions))
+        sol_dict = {args["n_samples"]:n_sol_dict}
+        ns = [args["n_samples"]]
+
+        if args["plot_grad"] == 1:
+            plot_grads_irm("n", sol_dict, ns, args)
 
 # Plot SEM
 # python main.py --n_iterations 50000 --n_reps 1 --dim 10 --k 4 --env_list 3 --env_rat 1:1:1 --seed 123  --cond_in eq_conf --plot 1 --setup_sem irm_erm_simple
