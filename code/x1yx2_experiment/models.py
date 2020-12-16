@@ -18,12 +18,18 @@ from scipy.stats import chisquare
 from scipy.stats import chi2
 import scipy.optimize
 import statsmodels.api as sm
+import scipy
+from sem import popul_erm_solution
 
 from torch.autograd import grad
 
 import matplotlib
 import matplotlib.pyplot as plt
 
+
+def check_for_nans(vec):
+    vec = vec.view(-1)
+    return torch.isnan(vec).sum() > 0
 
 class EarlyStopping(object):
     def __init__(self, patience):
@@ -53,10 +59,10 @@ class BestParameters(object):
     def __call__(self, err, params):
         if self.past != None:
             if err < self.past:
-                self.params = [par.clone() in params]
+                self.params = [par.clone() for par in params]
                 self.past = err
         else:
-            self.params = [par.clone() in params]
+            self.params = [par.clone() for par in params]
             self.past = err
 
 
@@ -68,10 +74,10 @@ def pretty(vector):
 
 
 class InvariantRiskMinimization(object):
-    def __init__(self, environments, args, orders=None, betas = None, orig_risk=False):
+    def __init__(self, environments, args, orders=None, betas = None, orig_risk=False, sigmas=None):
         best_reg = 0
-        best_err = 1e6
-        population = "popul" in args["setup_sem"]
+        best_err = float('inf')
+        population = "popul" in args["method_reg"]
 
         if population != True:
             # train from data - empricial risk minimization
@@ -82,13 +88,17 @@ class InvariantRiskMinimization(object):
 
         self.pairs = []; self.betas = []; self.ws = []
 
-        if population == 1:
-            if args["setup_sem"] == "irm_popul":
+        if population:
+            if args["method_reg"] == "irm_popul":
                 regs = [10.]
             else:
-                regs = [1e-4, 0.025]
+                regs = [1e-3]
         else:
-            regs = [0, 1e-5, 1e-4, 1e-3, 1e-2, 1e-1]
+            if args["method_reg"] == "all":
+                #regs = [0, 1e-5, 1e-4, 1e-3, 1e-2, 1e-1]
+                regs = [1e-5, 1e-3, 1e-1]
+            else:
+                regs = [ 1e-4, 1e-1]
 
         all_grads = {}
         eps = 1e-04
@@ -97,10 +107,10 @@ class InvariantRiskMinimization(object):
                 # population risk minimization
                 if orig_risk == False:
                     # optimize loss with transformed regularization term
-                    err = self.train_popul_transformed_reg(betas, args, reg=reg, init_true=args["phi_init"], eps=eps).item()
+                    err, grads = self.train_popul_transformed_reg(betas, sigmas, args, reg=reg, init_true=args["phi_init"], eps=eps)
                 elif orig_risk == True :
                     # optimize loss with original regularization term
-                    err, grads = self.train_popul_orig_reg(betas, args, reg=reg, init_true=args["phi_init"], eps=eps).item()
+                    err, grads = self.train_popul_orig_reg(betas, sigmas, args, reg=reg, init_true=args["phi_init"], eps=eps)
             else:
                 # empricial risk minimization
                 grads = self.train_transformed_reg(environments[:-1], args, reg=reg, patience=10**1, eps=eps)
@@ -128,14 +138,12 @@ class InvariantRiskMinimization(object):
         self.beta = self.phi @ self.w
         self.all_grads = all_grads
 
-    def train_popul_orig_reg(self, betas, args, reg=0, patience=15, init_true=0, eps=1e-05):
+    def train_popul_orig_reg(self, betas, sigmas, args, reg=0, patience=15, init_true=0, eps=1e-05):
         dim_x = betas[0].size(0)
 
         train_w = args["train_w"] == 1
-        self.w, self.phi = self.initialize_weights(dim_x, args, init_true = init_true, train_w = train_w, betas = betas)
+        opt = self.initialize_weights(dim_x, args, init_true = init_true, train_w = train_w, betas = betas, sigmas=sigmas)
 
-
-        opt = torch.optim.Adam([self.phi], lr=args["lr"])
         loss = torch.nn.MSELoss()
 
         early_stopping = EarlyStopping(patience=patience)
@@ -147,13 +155,15 @@ class InvariantRiskMinimization(object):
         for iteration in range(args["n_iterations"]):
             err = 0
 
-            for beta_e in betas:
-                
-                #M = (Id + reg* torch.inverse(self.phi.T @ self.phi))
-                invPhi = torch.inverse(self.phi.T @ self.phi)
-                PhiD = invPhi @ self.phi.T
-                M = (Id + reg * (PhiD.T @ PhiD))
-                err += ((beta_e - self.phi @ self.w).T @ M @ (beta_e - self.phi @ self.w) )
+            for beta_e, sigma_e in zip(betas, sigmas):
+                 
+                invPhi = torch.inverse(self.phi.T @ sigma_e @ self.phi)
+
+                PhiD = invPhi @ self.phi.T @ sigma_e
+                M = (sigma_e + reg * (PhiD.T @ PhiD))
+
+                err += ((beta_e - self.phi @ self.w).T @ M @ (beta_e - self.phi @ self.w) ).squeeze()
+                #print(M.size(), sigma_e.size(), PhiD.size(), err.size(), beta_e.size())
                 
             opt.zero_grad()
             w_str = pretty(self.solution())
@@ -163,8 +173,14 @@ class InvariantRiskMinimization(object):
             early_stopping(err.item())
 
             gr = torch.norm(self.phi.grad.view(-1))
+            if check_for_nans(gr): 
+                print(iteration, "nans in gradient")
+                break
+
+            params = [self.phi]
             if args["train_w"] == 1:
                 gr += torch.norm(self.w.grad.view(-1))
+                params += [self.w]
             if iteration % args["grad_freq"] == 0:
                 grads += [ gr.item()]
 
@@ -178,14 +194,13 @@ class InvariantRiskMinimization(object):
         self.phi = watch.params[0].clone()
         if args["train_w"] == 1:
             self.w = watch.params[1].clone()
-        return grads
+        return watch.past.item(), grads
 
-    def train_popul_transformed_reg(self, betas, args, reg=0, patience=15, init_true = 0, eps=1e-05):
+    def train_popul_transformed_reg(self, betas, sigmas, args, reg=0, patience=15, init_true = 0, eps=1e-05, train_w=False):
         dim_x = betas[0].size(0)
 
-        self.w, self.phi = self.initialize_weights(dim_x, args, init_true = init_true, train_w = False, betas= betas)
+        opt = self.initialize_weights(dim_x, args, init_true = init_true, train_w = train_w, betas= betas, sigmas=sigmas)
 
-        opt = torch.optim.Adam([self.phi], lr=args["lr"])
         loss = torch.nn.MSELoss()
 
         early_stopping = EarlyStopping(patience=patience)
@@ -196,11 +211,11 @@ class InvariantRiskMinimization(object):
             penalty = 0
             error = 0
 
-            for beta_e in betas:
-                error += loss(self.phi @ self.w, beta_e)
-                penalty += 4*(self.phi.T @ (beta_e - self.phi @ self.w) ).pow(2).sum()#.mean()
+            for beta_e, sigma_e in zip(betas, sigmas):
+                error += ((self.phi @ self.w - beta_e).T @ sigma_e @ (self.phi @ self.w - beta_e)).sum()
+                penalty += 4*(self.phi.T @ sigma_e @ (beta_e - self.phi @ self.w) ).pow(2).sum()#.mean()
 
-            if args["setup_sem"] == "irm_popul":
+            if args["method_reg"] == "irm_popul":
                 err = error + reg * penalty
             else:
                 err = reg * error + (1 - reg) * penalty
@@ -212,8 +227,13 @@ class InvariantRiskMinimization(object):
             early_stopping(err.item())
 
             gr = torch.norm(self.phi.grad.view(-1))
+            if check_for_nans(gr): 
+                print(iteration, "nans in gradient")
+                break
+            params = [self.phi]
             if args["train_w"] == 1:
                 gr += torch.norm(self.w.grad.view(-1))
+                params += [self.w]
             if iteration % args["grad_freq"] == 0:
                 grads += [ gr.item()]
 
@@ -227,14 +247,13 @@ class InvariantRiskMinimization(object):
         self.phi = watch.params[0].clone()
         if args["train_w"] == 1:
             self.w = watch.params[1].clone()
-        return grads
+        return watch.past.item(), grads
 
-    def train_transformed_reg(self, environments, args, reg=0, patience = 15, eps = 1e-05):
+    def train_transformed_reg(self, environments, args, reg=0, patience = 15, eps = 1e-05, betas= None, sigmas=None, init_true=0, train_w=False):
         dim_x = environments[0][0].size(1)
 
-        self.w, self.phi = self.initialize_weights(dim_x, args, init_true = 0, train_w = False)
+        opt = self.initialize_weights(dim_x, args, init_true = init_true, train_w = train_w, betas= betas, sigmas=sigmas)
 
-        opt = torch.optim.Adam([self.phi], lr=args["lr"])
         loss = torch.nn.MSELoss()
         early_stopping = EarlyStopping(patience=patience)
         grads = []
@@ -257,6 +276,10 @@ class InvariantRiskMinimization(object):
             early_stopping(err.item())
 
             gr = torch.norm(self.phi.grad.view(-1))
+            if check_for_nans(gr): 
+                print(iteration, "nans in gradient")
+                break
+
             params = [self.phi]
             if args["train_w"] == 1:
                 gr += torch.norm(self.w.grad.view(-1))
@@ -276,34 +299,107 @@ class InvariantRiskMinimization(object):
             self.w = watch.params[1].clone()
         return grads
 
-    def initialize_weights(self, dim_x, args, init_true = 0, betas = None, train_w= False):
-
+    def initialize_weights(self, dim_x, args, init_true = 0, betas = None, sigmas=None, train_w= False):
         if init_true == 1:
             # initialize parameters to true ones (ERM)
-            phi = torch.nn.Parameter(torch.diag(torch.mean(torch.stack(betas),dim=0).squeeze()))
+            eps = torch.normal(mean=torch.zeros(dim_x**2), std=torch.ones(dim_x**2)*1e-5).view(dim_x, dim_x)
+            u_hat = popul_erm_solution(betas, sigmas) 
+            self.phi = torch.nn.Parameter(torch.diag(u_hat.squeeze()) + eps)
+            params = [self.phi]
             if train_w:
                 # train parameters w
-                w = torch.nn.Parameter(torch.ones(dim_x, 1))
+                self.w = torch.nn.Parameter(torch.ones(dim_x, 1))
+                params += [self.w]
             else:
                 # set parameters w = 1 and fix them 
-                w = torch.ones(dim_x, 1)
-                w.requires_grad = True
+                self.w = torch.ones(dim_x, 1)
+                self.w.requires_grad = True
         else:
             # randomly initialize parameters Phi
-            phi = torch.nn.Parameter(torch.randn(dim_x, dim_x))
-            if train_w:
-                w = torch.nn.Parameter(torch.randn(dim_x, 1))
+            self.phi = torch.nn.Parameter(torch.randn(dim_x, dim_x))
+            params = [self.phi]
+            if train_w:                
+                self.w = torch.nn.Parameter(torch.randn(dim_x, 1))
+                params += [self.w]
             else:
-                w = torch.randn(dim_x, 1)
-                w.requires_grad = True
+                self.w = torch.randn(dim_x, 1)
+                self.w.requires_grad = True
+
+        if args["optim"] == "adam":
+            opt = torch.optim.Adam(params, lr=args["lr"])
+        elif args["optim"] == "sgd":
+            opt = torch.optim.SGD(params, lr=args["lr"], momentum=0.9)
+        elif args["optim"] == "newton":
+            opt = torch.optim.SGD(params, lr=args["lr"], momentum=0.9)
+            self.parameters = params
 
         print("init_w: train_w = ", train_w, " init_Phi: init_true = ", init_true==1)
-        return w, phi
+        return opt
+
+    def get_theta(self):
+        params = []
+        for f in self.parameters:
+            params = params + [torch.flatten(f)]
+        return torch.cat(params, 0)
+    
+    def update_theta(self, dtheta):
+        curr = 0
+        for p in self.parameters:
+            Nsize = torch.flatten(p.data).size()[0]
+            dpar = dtheta[curr:curr+Nsize].reshape(p.data.size())
+            p.data = p.data + dpar
+            curr += Nsize
+
+    def zero_grad_newton(self):
+        for p in self.parameters:
+            print("param", p.grad)
+            p.grad.data.zero_()
+    
+    def newton_step_update(self, loss):
+        def jacobian(y, x, create_graph=False):                                                               
+            jac = []                                                                                          
+            flat_y = y.reshape(-1)                                                                            
+            grad_y = torch.zeros_like(flat_y)                                                                 
+            for i in range(len(flat_y)):                                                                      
+                grad_y[i] = 1.                                                                                
+                grad_x, = torch.autograd.grad(flat_y, x, grad_y, retain_graph=True, create_graph=create_graph)
+                jac.append(grad_x.reshape(x.shape))                                                           
+                grad_y[i] = 0.                                                                                
+            return torch.stack(jac).reshape(y.shape + x.shape)                                                
+                                                                                                              
+        def hessian_grad(y, x):    
+            grd = jacobian(y, x, create_graph=True)                                                                               
+            hess = jacobian(grd, x) 
+            return hess, grd
+
+        # compute original gradient, tracking computation graph
+        #self.zero_grad_newton()
+        
+        # flattened parameters
+        theta = self.get_theta()
+        print(theta.size())
+        # take the second gradient
+        hess, grad_vec = hessian_grad(loss, theta)
+
+        # concatenate the results over the different components of the network
+        dtheta = - torch.inverse(hess) @ grad_vec.view(-1, 1)
+
+        self.update_theta(dtheta)
+        self.zero_grad_newton()
+        
 
     def make_optimization_step(self, err, opt, iteration, args, summary):
-        opt.zero_grad()
-        err.backward()
-        opt.step()
+
+        if args["optim"] == "newton":
+            self.newton_step_update(err)
+            if args["train_w"] == 1:
+                self.phi, self.w = self.parameters
+            else:
+                self.phi = self.parameters
+        else:
+            opt.zero_grad()
+            err.backward()
+            opt.step()
 
         if args["verbose"] and iteration % 10000 == 0:
             print(summary)
@@ -511,7 +607,7 @@ class InvariantCausalPrediction(object):
                                 # outside of confidence interval
                                 flag = True
 
-                        elif args["cond_in"] == 'eq_chi':
+                        elif args["cond_in"] == 'eq_chi_delta':
                             # gamma is 1D
                             # get p value for chi^2(m-1) distribution 
                             # if p < alpha  ==>  gamma_1 != ... != gamma_m
@@ -560,7 +656,7 @@ class InvariantCausalPrediction(object):
             else:
                 if args["verbose"]:
                     pass
-                    #print("NOT Accepted subset:", subset, "p_value:", p_value)
+                    #print("*** NOT Accepted subset:", subset, "p_value:", p_value)
 
         if len(accepted_subsets):
             accepted_features = list(set.intersection(*accepted_subsets))
@@ -586,7 +682,7 @@ class InvariantCausalPrediction(object):
 
 
 class EmpiricalRiskMinimizer(object):
-    def __init__(self, environments, args, orders=None, betas=None):
+    def __init__(self, environments, args, orders=None, betas=None, sigmas = None):
         def pretty(vector):
             vlist = vector.view(-1).tolist()
             return "[" + ", ".join("{:+.3f}".format(vi) for vi in vlist) + "]"

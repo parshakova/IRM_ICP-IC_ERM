@@ -5,7 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 #
 
-from sem import ChainEquationModel,SEM_X1YX2X3,IRM_ERM_SimpleEnvs
+from sem import *
 from models import *
 
 import matplotlib.pyplot as plt
@@ -59,25 +59,37 @@ def setup_models_environments(args):
     else:
         setup_str = ""
     
-    all_methods = {
+
+    if  args["method_reg"] in ["irm_popul", "irm_erm_popul", "irm_erm_nsample"]: 
+        all_methods = {
             "ERM": EmpiricalRiskMinimizer,
-            "ICP": InvariantCausalPrediction,
             "IRM": InvariantRiskMinimization
-    }
-    if  args["method_reg"] != "all": 
-        del all_methods["ICP"]
+        }
+
+    elif args["method_reg"] == "icp_erm_nsample":
+        all_methods = {
+                "ERM": EmpiricalRiskMinimizer,
+                "ICP": InvariantCausalPrediction
+        }
+    elif args["method_reg"] == "all":
+        all_methods = {
+                "ERM": EmpiricalRiskMinimizer,
+                "ICP": InvariantCausalPrediction,
+                "IRM": InvariantRiskMinimization
+        }
     
 
     all_sems = []
-    betas = []; env_orders = []
+    betas = []; env_orders = []; sigmas = []    
     all_environments = []
     n_env = int(args["env_list"])
 
     if args["setup_sem"] == "chain":
         sem = ChainEquationModel(args["dim"], ones=args["setup_ones"], hidden=args["setup_hidden"], scramble=args["setup_scramble"], hetero=args["setup_hetero"])
+    
     elif args["setup_sem"] == "causal":
-
         sem = SEM_X1YX2X3(args["dim"],args["k"], args["env_shuffle"])
+    
     elif args["setup_sem"] == "indep":
         sem = IRM_ERM_SimpleEnvs(args["dim"])
 
@@ -95,12 +107,15 @@ def setup_models_environments(args):
                 res = sem(n, e)
                 environments += [res[:2]]
                 betas += [res[2]]
+                sigmas += [res[3]]
+                if args["setup_sem"] == "causal":
+                    env_orders += [res[4]]
 
         elif args["method_reg"] == "chain":
             env_list = [float(e) for e in args["env_list"].split(",")]
             environments = [sem(args["n_samples"], e) for e in env_list]
 
-        elif args["method_reg"] == "all":
+        elif args["method_reg"] in ["all", "icp_erm_nsample"]:
 
             env_list = range(int(args["env_list"]))
             ratios = list(map(int, args["env_rat"].split(':')))
@@ -112,14 +127,17 @@ def setup_models_environments(args):
             for e in env_list:
                 res = sem(n_samples[e], e)
                 environments += [res[:2]]
-                env_orders += [res[2]]
+                betas += [res[2]]
+                sigmas += [res[3]]
+                if args["setup_sem"] == "causal":
+                    env_orders += [res[4]]
         else:
             raise NotImplementedError
 
         all_sems.append(sem)
         all_environments.append(environments)
 
-    return all_sems, all_environments, setup_str, betas, all_methods, env_orders
+    return all_sems, all_environments, setup_str, betas, sigmas, all_methods, env_orders
 
 
 
@@ -127,7 +145,7 @@ def setup_models_environments(args):
 def solve_irm_erm_icp(args):
 
     all_solutions = []
-    all_sems, all_environments, setup_str, _, methods, env_orders = setup_models_environments(args)
+    all_sems, all_environments, setup_str, betas_e, sigmas_e, methods, env_orders = setup_models_environments(args)
 
     sol_dict = {}
     for sem, environments in zip(all_sems, all_environments):
@@ -164,21 +182,22 @@ def solve_irm_erm_icp(args):
     return all_solutions, sol_dict
 
 
-def compute_u_rhs(u, betas, lamb, eta):
+def compute_u_rhs(u, betas, sigmas, lamb, eta):
         # u for IRM
         a = 0; b = 0
-        for beta_e in betas:
-            dot_prod = torch.matmul(u.T, beta_e - u).squeeze()
+        for beta_e, sigma_e in zip(betas, sigmas):
+            dot_prod = torch.matmul(u.T @ sigma_e, beta_e - u).squeeze()
             a += (eta - lamb*dot_prod)*beta_e
             b += (eta - 2*lamb*dot_prod)
         res = a / b
         return res
 
+
 # args["method_reg"] == "irm_erm_nsample"
-def solve_irm2_erm(args):
+def solve_irm2_erm_nsample(args):
 
     n_env = int(args["env_list"])
-    all_sems, all_environments, setup_str, betas, methods, env_orders = setup_models_environments(args)
+    all_sems, all_environments, setup_str, betas, sigmas, methods, env_orders = setup_models_environments(args)
 
     sol_dict = {}
     p = args["dim"]
@@ -190,10 +209,9 @@ def solve_irm2_erm(args):
         sem_betas = sem.solution()
 
         for method_name, method_constructor in methods.items():
-            method = method_constructor(environments, args)
-
+            method = method_constructor(environments, args, betas = betas, sigmas = sigmas)
+            print("******** %s *********"%method_name)
             if method_name == "IRM":
-                print("******** IRM *********")
                 sol_dict[method_name] = []
                 for (lamb,phi) in method.pairs:
                     # verify whether Phi_ort = 0
@@ -202,18 +220,61 @@ def solve_irm2_erm(args):
                     u = torch.matmul(phi, ones)
                     phi_ort = torch.matmul(phi, P_ort)
                     print("||Phi_ort|| = ", torch.norm(phi_ort))
-                    u_hat = compute_u_rhs(u, betas[1:], lamb=(1-lamb)*4./args["dim"], eta=lamb)
+                    u_hat = compute_u_rhs(u, betas, sigmas, lamb=(1-lamb)*4./args["dim"], eta=lamb)
                     print("||u-u_hat|| = ", torch.norm(u-u_hat))
                     sol_dict[method_name] += [(lamb, torch.norm(phi_ort), torch.norm(u-u_hat))]
                 sol_dict["IRM_grad"] = [method.all_grads]
 
             elif method_name == "ERM":
-                print("******** ERM *********")
-                u_hat = 1./n_env * sum(betas)
                 u = method.w
+                u_hat = popul_erm_solution(betas, sigmas)
+                
                 print("||u-u_hat|| = ", torch.norm(u-u_hat))
                 sol_dict[method_name]  = torch.norm(u-u_hat)
 
+    return sol_dict
+
+
+# args["method_reg"] == "icp_erm_nsample"
+def solve_icp_erm_nsample(args):
+
+    n_env = int(args["env_list"])
+    all_sems, all_environments, setup_str, betas, sigmas, methods, env_orders = setup_models_environments(args)
+
+    sol_dict = {}
+    p = args["dim"]
+
+    cond_ins = ["n", "eq_chi_delta", "eq_chi_var", "eq_abs", "eq_conf_delta", "eq_conf_var"]
+    
+    for sem, environments in zip(all_sems, all_environments):
+        sem_betas = sem.solution()
+        sem_solution, sem_scramble = sem.solution()
+        solutions = [
+            "{} SEM {} {:.5f} {:.5f}".format(setup_str,
+                                             pretty(sem_solution), 0, 0)
+        ]
+        for method_name, method_constructor in methods.items():
+            
+            print("******** %s *********"%method_name)
+            if method_name == "ICP":
+                sol_dict[method_name] = []
+                for cond_in in cond_ins:
+                    args["cond_in"]  = cond_in
+                    method = method_constructor(environments, args, orders=env_orders)
+                    
+                    method_solution = sem_scramble @ method.solution()
+                    err_causal, err_noncausal, ecaus, enoncaus = errors(sem_solution, method_solution)
+                    solutions.append("{} {} {:.5f} {:.5f}".format(method_name+"_"+cond_in,pretty(method_solution),err_causal,err_noncausal))
+                    sol_dict[method_name] += [(cond_in, method_solution.detach().view(-1).numpy(), ecaus.detach().view(-1).numpy(), enoncaus.detach().view(-1).numpy())]
+
+            elif method_name == "ERM":
+                method = method_constructor(environments, args, env_orders)
+                method_solution = sem_scramble @ method.solution()
+                err_causal, err_noncausal, ecaus, enoncaus = errors(sem_solution, method_solution)
+                sol_dict[method_name]  = [method.w, ecaus.detach().view(-1).numpy(), enoncaus.detach().view(-1).numpy()]
+                solutions.append("{} {} {:.5f} {:.5f}".format(method_name,pretty(method_solution),err_causal,err_noncausal))
+
+    print("\n".join(solutions))
     return sol_dict
 
 
@@ -221,7 +282,7 @@ def solve_irm2_erm(args):
 def solve_irm2_erm_popul(args):
 
     n_env = int(args["env_list"])
-    all_sems, all_environments, setup_str, betas, methods, env_orders = setup_models_environments(args)
+    all_sems, all_environments, setup_str, betas, sigmas, methods, env_orders = setup_models_environments(args)
 
     sol_dict = {}
     p = args["dim"]
@@ -234,9 +295,9 @@ def solve_irm2_erm_popul(args):
 
         for method_name in ["IRM", "ERM"]:
             method_constructor = methods[method_name]
+            print("******** %s *********"%method_name)
             if method_name == "IRM":
-                print("******** IRM *********")
-                method = method_constructor(environments, args, betas = betas)
+                method = method_constructor(environments, args, betas = betas, sigmas = sigmas)
                 
                 sol_dict[method_name] = []
                 for (reg,phi) in method.pairs:
@@ -247,7 +308,7 @@ def solve_irm2_erm_popul(args):
                     phi_ort = torch.matmul(phi, P_ort)
                     print("||Phi_ort|| = ", torch.norm(phi_ort))
                     
-                    u_hat = compute_u_rhs(u, betas, lamb=(1-reg)*4./args["dim"], eta=reg)
+                    u_hat = compute_u_rhs(u, betas, sigmas, lamb=(1-reg)*4./args["dim"], eta=reg)
                     print("||u-u_hat|| = ", torch.norm(u-u_hat))
                     sol_dict[method_name] += [(reg, torch.norm(phi_ort), torch.norm(u-u_hat))]
 
@@ -256,8 +317,7 @@ def solve_irm2_erm_popul(args):
 
 
             elif method_name == "ERM":
-                print("******** ERM *********")
-                u_hat = 1./n_env * sum(betas)
+                u_hat = popul_erm_solution(betas, sigmas)
                 sol_dict[method_name]  = [torch.norm(beta_irm - u_hat).detach().item()]
 
     return sol_dict
@@ -267,7 +327,7 @@ def solve_irm2_erm_popul(args):
 def solve_irm1_irm2_popul(args):
 
     n_env = int(args["env_list"])
-    all_sems, all_environments, setup_str, betas, methods, env_orders = setup_models_environments(args)
+    all_sems, all_environments, setup_str, betas, sigmas, methods, env_orders = setup_models_environments(args)
 
     p = args["dim"]
 
@@ -276,7 +336,7 @@ def solve_irm1_irm2_popul(args):
     P_ort = torch.eye(p) - P
     sem_betas = all_sems[0].solution()
     
-    barycenter = torch.mean(torch.stack(betas), dim=0)
+    barycenter = popul_erm_solution(betas, sigmas)
     sol_dict = {}
     sol_dict["erm"] = barycenter
 
@@ -286,20 +346,13 @@ def solve_irm1_irm2_popul(args):
     for init in inits:
         args["phi_init"] = init
 
-        args["train_w"] = 1        
-        method = methods["IRM"](all_environments[0], args, betas = betas, orig_risk=True)
-        idx = 0
-        reg, phi = method.pairs[idx]
-        w, w_beta = method.ws[idx], method.betas[idx]
-        sol_dict["irm1_"+str(init)] = w_beta
-
-   
-        args["train_w"] = 0
-        method = methods["IRM"](all_environments[0], args, betas = betas, orig_risk=False)
-        idx = 0
-        reg, phi = method.pairs[idx]
-        w, w_beta = method.ws[idx], method.betas[idx]
-        sol_dict["irm2_"+str(init)] = w_beta
+        for  train_w in [1, 0]:
+            args["train_w"] = train_w        
+            method = methods["IRM"](all_environments[0], args, betas = betas, orig_risk= (train_w == 1), sigmas = sigmas)
+            idx = 0
+            reg, phi = method.pairs[idx]
+            w, w_beta = method.ws[idx], method.betas[idx]
+            sol_dict["irm%d_"%(2-train_w)+str(init)] = w_beta
 
     return sol_dict
 
@@ -364,6 +417,88 @@ def plot_irm_erm_icp(sol_dict, ns, dim, args):
     if args["plot_grad"] == 1:
         plot_grads_irm("n", sol_dict, ns, args)
     
+
+def plot_icp_erm_nsample(sol_dict, ns):
+    """
+    sol_dict[n][ICP] += [(cond_in, method.solution, err_causal, err_noncausal)]
+    method_name in {ICP, ERM} 
+    sol_dict[n][ERM] = [beta, err_causal, err_noncausal]
+    """
+    method_names = ["ERM", "ICP"]
+
+    fig, axs = plt.subplots(nrows=1, ncols=len(ns), 
+                                    figsize=(5*len(ns), 5))
+    
+    cond_ins_len = len(sol_dict[ns[0]]["ICP"])
+    
+    if (cond_ins_len+1) %2 == 0:
+        pos = list(range(-(cond_ins_len+1)//2+1, (cond_ins_len+1)//2+1, 1))
+    else:
+        pos = list(range(-(cond_ins_len+1)//2+1, (cond_ins_len+1)//2+1, 1))
+
+    print(pos, cond_ins_len)
+    width = 0.9/(cond_ins_len + 1)
+    dim = args["dim"]
+    ind = np.arange(dim)
+    for i,n in enumerate(ns):
+        count = 0
+        for k, method in enumerate(method_names):
+            if method == "ICP":
+                for vals in sol_dict[n][method]:
+                    cond_in, beta = vals[0], vals[1]
+                    axs[i].bar(ind + pos[count]*width, beta, width, label=method+ "_"+cond_in)
+                    count += 1
+            else:
+                x = sol_dict[n][method][0]
+                axs[i].bar(ind + pos[count]*width, x, width, label=method)
+                count += 1
+        axs[i].set_xticks(ind)
+        axs[i].set_xticklabels(('x%d'%j for j in range(x.shape[0])))
+        axs[i].legend(prop={'size': 6})
+        axs[i].set_title('N = %d'%n)
+
+    #plt.savefig('plot_betas%s.png'%args["env_rat"])
+    plt.show()
+    
+    # plot bars for causal - non causal errors
+    fig, axs = plt.subplots(nrows=2, ncols=len(ns)) 
+                                    #figsize=(5*len(ns), 5))
+
+    width = 0.5
+    hatch = [None, "//"]
+    ind = np.arange(cond_ins_len+1)
+    for i,n in enumerate(ns):
+        for k in range(2):
+            x_means = []; x_vars = []; colors = []; labels = []; count =0
+            for m, method in enumerate(method_names):
+                if method == "ICP":
+                    for vals in sol_dict[n][method]:
+                        cond_in = vals[0]
+                        x_means += [np.mean(vals[k+2])]
+                        x_vars += [np.std(vals[k+2])]
+                        colors += ["C" + str(count)]
+                        labels += ["ICP_"+cond_in]
+                        count += 1
+                else:
+                    x_means += [np.mean(sol_dict[n][method][k+1])]
+                    x_vars += [np.std(sol_dict[n][method][k+1])]
+                    colors += ["C" + str(count)]
+                    labels += [method]
+
+                count += 1
+
+            axs[k,i].bar(ind, x_means, width, yerr=np.array(x_vars), log=True, color=colors, hatch=hatch[k])
+
+            axs[k,i].set_xticks(ind)
+            axs[k,i].set_xticklabels(tuple(labels))
+            #axs[k,i].legend(prop={'size': 10})
+            if k == 0:
+                axs[k,i].set_title('Caus N = %d'%n)
+            else:
+                axs[k,i].set_title('Nonc N = %d'%n)
+
+    plt.show()
+
 
 def plot_grads_irm(name, sol_dict, ns, args):
 
@@ -437,7 +572,7 @@ def plot_envs(sol_dict, envs, dim, args):
         plot_grads_irm("|E|", sol_dict, envs, args)
 
 
-def plot_irm_erm(sol_dict, ns):
+def plot_irm_erm_nsample(sol_dict, ns):
     """
     sol_dict[n][IRM] = [lamb, ||Phi_ort||, ||u-u_hat||, {reg:||grad||}]
     sol_dict[n][ERM] = [||u-u_hat||]
@@ -481,6 +616,7 @@ def plot_irm_erm(sol_dict, ns):
     axs[0].set_xticks(ind)
     axs[0].set_xticklabels((str(n) for n in ns))
     axs[0].legend(prop={'size': 10})
+    axs[0].set_yscale("log")
     axs[0].set_title("||u-u_hat||")
 
     for reg in regs:
@@ -488,6 +624,7 @@ def plot_irm_erm(sol_dict, ns):
     axs[1].set_xticks(ind)
     axs[1].set_xticklabels((str(n) for n in ns))
     axs[1].set_title("||Phi_ort||")
+    axs[1].set_yscale("log")
     axs[1].legend(prop={'size': 10})
 
     plt.show()
@@ -530,6 +667,7 @@ def plot_irm_erm_popul(sol_dict, envs):
     axs[0].set_xticks(ind)
     axs[0].set_xticklabels((str(e) for e in envs))
     axs[0].legend(prop={'size': 10})
+    axs[0].set_yscale("log")
     axs[0].set_title("||u-u_hat||")
 
     for reg in regs:
@@ -537,6 +675,7 @@ def plot_irm_erm_popul(sol_dict, envs):
     axs[1].set_xticks(ind)
     axs[1].set_xticklabels((str(e) for e in envs))
     axs[1].set_title("||Phi_ort||")
+    axs[1].set_yscale("log")
     axs[1].legend(prop={'size': 10})
 
     diffs = []
@@ -546,8 +685,9 @@ def plot_irm_erm_popul(sol_dict, envs):
     axs[2].set_xticks(ind)
     axs[2].set_xticklabels((str(e) for e in envs))
     axs[2].set_title("||beta_irm - beta_erm||")
+    axs[2].set_yscale("log")
 
-    plt.savefig('irm_erm_curves_dim%d.png'%args["dim"])
+    #plt.savefig('irm_erm_curves_dim%d.png'%args["dim"])
     plt.show()
 
     if args["plot_grad"] == 1:
@@ -597,6 +737,7 @@ def plot_irm1_irm2_popul(sol_dict, envs):
     axs[len(envs)].set_xticklabels((str(e) for e in envs))
     axs[len(envs)].legend(prop={'size': 6})
     axs[len(envs)].set_title("||beta_irm - beta_erm||")
+    axs[len(envs)].set_yscale("log")
 
 
     plt.savefig('diff_irm12_erm_dim%d.png'%args["dim"])
@@ -628,24 +769,35 @@ if __name__ == '__main__':
     parser.add_argument('--env_rat', type=str, default="1:10:100", help="ratios of samples between environments")
     parser.add_argument('--env_shuffle', type=int, default=1)
     parser.add_argument('--setup_sem', type=str, default="causal", help = "<causal>, <indep>")
-    parser.add_argument('--method_reg', type=str, default="all", help = "<irm_popul>, <irm_erm_popul>, <irm_erm_simple>, <all>")
+    parser.add_argument('--method_reg', type=str, default="all", help = "<irm_popul>, <irm_erm_popul>, <irm_erm_nsample>, <all>")
     parser.add_argument('--setup_ones', type=int, default=1)
     parser.add_argument('--phi_init', type=int, default=0)
     parser.add_argument('--setup_hidden', type=int, default=0)
-    parser.add_argument('--popul', type=int, default=0, help="optimize for population loss or empirical loss")
     parser.add_argument('--train_w', type=int, default=0, help = "train parameters w or keep them fixed (w=1)")
     parser.add_argument('--setup_hetero', type=int, default=0)
     parser.add_argument('--setup_scramble', type=int, default=0)
+    parser.add_argument('--optim', type=str, default="adam")
     parser.add_argument('--grad_freq', type=int, default=100, help="frequency for recording grad norm values of IRM")
     parser.add_argument('--plot_grad', type=int, default=0, help = "plot gradient norms for IRM")
     args = dict(vars(parser.parse_args()))
     faulthandler.enable()
 
-    if args["method_reg"] == "irm_popul":
+
+    if args["method_reg"] == "icp_erm_nsample":
+        # ICP different flavors vs ERM  
+        sol_dict = {}
+        ns = [1000, 3000, 5000, 10000, 50000]
+        for n in ns:
+            print("#"*10 + " %d n "%n + "#"*10)
+            args["n_samples"] = n
+            sol_dict[n] = solve_icp_erm_nsample(args)
+        plot_icp_erm_nsample(sol_dict, ns)
+
+
+    elif args["method_reg"] == "irm_popul":
         # IRM1: Optimize Phi, w
         # IRM2: Optimize Phi, w=1
-        # IRM1 vs IRM2 vs ERM       
-        args["popul"] = 2
+        # IRM1 vs IRM2 vs ERM   
         n = 5000
         envs = [3, 5, 8, 10, 15]
         sol_dict = {}
@@ -659,10 +811,9 @@ if __name__ == '__main__':
 
     elif args["method_reg"] == "irm_erm_popul":
         # IRM2 vs ERM population
-        args["popul"] = 1
         sol_dict = {}
         n = 5000
-        envs = [3, 5, 8, 10, 11, 12, 15]
+        envs = [3, 5, 8, 10, 11, 15]
         for e in envs:
             print("#"*10 + " %d envs "%e + "#"*10)
             args["n_samples"] = n
@@ -678,9 +829,9 @@ if __name__ == '__main__':
         ns = [1000, 3000, 5000, 10000, 50000]
         for n in ns:
             args["n_samples"] = n
-            n_sol_dict = solve_irm2_erm(args)
+            n_sol_dict = solve_irm2_erm_nsample(args)
             sol_dict[n] = n_sol_dict
-        plot_irm_erm(sol_dict, ns)
+        plot_irm_erm_nsample(sol_dict, ns)
 
 
     elif args["plot"]==1 and args["method_reg"] == "all":
@@ -702,7 +853,8 @@ if __name__ == '__main__':
         # number of environments, while keeping fixed number of samples in each environment
         sol_dict = {}
         n_each = 1000
-        envs = [3, 5, 8, 10, 12, 15]  
+        envs = [3, 5, 8, 10, 12, 15] 
+        envs = [3, 5] 
         for e in envs:
             print("#"*10 + " %d envs "%e + "#"*10)
             n = n_each*e
