@@ -1,6 +1,6 @@
 # Code repository for Invariant Risk Minimization
 
-Source code for [the paper](https://arxiv.org/abs/1907.02893v1):
+Modified code from the [source](https://github.com/facebookresearch/InvariantRiskMinimization) for [the paper](https://arxiv.org/abs/1907.02893v1):
 
 ```
 @article{InvariantRiskMinimization,
