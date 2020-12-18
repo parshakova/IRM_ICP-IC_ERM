@@ -75,7 +75,7 @@ def pretty(vector):
 
 class InvariantRiskMinimization(object):
     def __init__(self, environments, args, orders=None, betas = None, orig_risk=False, sigmas=None):
-        best_reg = 0
+        best_reg = 0; env = []
         best_err = float('inf')
         population = "popul" in args["method_reg"]
 
@@ -85,6 +85,7 @@ class InvariantRiskMinimization(object):
             x_val = environments[-1][0]
             y_val = environments[-1][1]
             print("IRM reg n_size", x_val.numpy().shape)
+            env = environments[:-1]
 
         self.pairs = []; self.betas = []; self.ws = []
 
@@ -102,18 +103,14 @@ class InvariantRiskMinimization(object):
 
         all_grads = {}
         eps = 1e-04
+
         for reg in regs:
-            if population:
-                # population risk minimization
-                if orig_risk == False:
-                    # optimize loss with transformed regularization term
-                    err, grads = self.train_popul_transformed_reg(betas, sigmas, args, reg=reg, init_true=args["phi_init"], eps=eps)
-                elif orig_risk == True :
-                    # optimize loss with original regularization term
-                    err, grads = self.train_popul_orig_reg(betas, sigmas, args, reg=reg, init_true=args["phi_init"], eps=eps)
-            else:
-                # empricial risk minimization
-                grads = self.train_transformed_reg(environments[:-1], args, reg=reg, patience=10**1, eps=eps)
+
+            loss_function = self.create_loss_func(betas, sigmas, args, reg, orig_risk, env)
+
+            err, grads = self.train_model(betas, sigmas, args, loss_function, env=env, reg=reg, \
+                                            init_true=args["phi_init"], eps=eps, orig_risk = orig_risk)
+            if not population:
                 err = (x_val @ self.solution() - y_val).pow(2).mean().item()
 
             all_grads[reg] = grads
@@ -138,7 +135,8 @@ class InvariantRiskMinimization(object):
         self.beta = self.phi @ self.w
         self.all_grads = all_grads
 
-    def train_popul_orig_reg(self, betas, sigmas, args, reg=0, patience=15, init_true=0, eps=1e-05):
+
+    def train_model(self, betas, sigmas, args, loss_function, env=None, reg=0, patience=15, init_true=0, eps=1e-05, orig_risk = False):
         dim_x = betas[0].size(0)
 
         train_w = args["train_w"] == 1
@@ -153,91 +151,28 @@ class InvariantRiskMinimization(object):
         watch = BestParameters()
 
         for iteration in range(args["n_iterations"]):
-            err = 0
 
-            for beta_e, sigma_e in zip(betas, sigmas):
-                 
-                invPhi = torch.inverse(self.phi.T @ sigma_e @ self.phi)
-
-                PhiD = invPhi @ self.phi.T @ sigma_e
-                M = (sigma_e + reg * (PhiD.T @ PhiD))
-
-                err += ((beta_e - self.phi @ self.w).T @ M @ (beta_e - self.phi @ self.w) ).squeeze()
-                #print(M.size(), sigma_e.size(), PhiD.size(), err.size(), beta_e.size())
+            error, penalty, err = loss_function(self.phi, self.w)
                 
-            opt.zero_grad()
             w_str = pretty(self.solution())
-            summary = "{:05d} | {:.5f} | {:.5f} |  {}".format(iteration, reg, err.item(), w_str)
-
-            self.make_optimization_step(err, opt, iteration, args, summary)
-            early_stopping(err.item())
-
-            gr = torch.norm(self.phi.grad.view(-1))
-            if check_for_nans(gr): 
-                print(iteration, "nans in gradient")
-                break
-
-            params = [self.phi]
-            if args["train_w"] == 1:
-                gr += torch.norm(self.w.grad.view(-1))
-                params += [self.w]
-            if iteration % args["grad_freq"] == 0:
-                grads += [ gr.item()]
-
-            watch(gr, params)
-
-            if gr < eps: # or early_stopping.early_stop 
-                print("Early stopping at %d"%iteration)
-                break
-
-        print("iteration = ", iteration, "gradient = ", watch.past)
-        self.phi = watch.params[0].clone()
-        if args["train_w"] == 1:
-            self.w = watch.params[1].clone()
-        return watch.past.item(), grads
-
-    def train_popul_transformed_reg(self, betas, sigmas, args, reg=0, patience=15, init_true = 0, eps=1e-05, train_w=False):
-        dim_x = betas[0].size(0)
-
-        opt = self.initialize_weights(dim_x, args, init_true = init_true, train_w = train_w, betas= betas, sigmas=sigmas)
-
-        loss = torch.nn.MSELoss()
-
-        early_stopping = EarlyStopping(patience=patience)
-        grads = []
-        watch = BestParameters()
-
-        for iteration in range(args["n_iterations"]):
-            penalty = 0
-            error = 0
-
-            for beta_e, sigma_e in zip(betas, sigmas):
-                error += ((self.phi @ self.w - beta_e).T @ sigma_e @ (self.phi @ self.w - beta_e)).sum()
-                penalty += 4*(self.phi.T @ sigma_e @ (beta_e - self.phi @ self.w) ).pow(2).sum()#.mean()
-
-            if args["method_reg"] == "irm_popul":
-                err = error + reg * penalty
+            if "popul" in args["method_reg"] and orig_risk ==True: 
+                summary = "{:05d} | {:.5f} | {:.5f} |  {}".format(iteration, reg, err.item(), w_str)
             else:
-                err = reg * error + (1 - reg) * penalty
-            
-            w_str = pretty(self.solution())
-            summary = "{:05d} | {:.5f} | {:.5f} | {:.5f} | {}".format(iteration, reg, error, penalty,
+                summary = "{:05d} | {:.5f} | {:.5f} | {:.5f} | {}".format(iteration, reg, error, penalty,
                                                                       w_str)
-            self.make_optimization_step(err, opt, iteration, args, summary)
-            early_stopping(err.item())
 
-            gr = torch.norm(self.phi.grad.view(-1))
+            gr = self.make_optimization_step(err, opt, iteration, args, summary, loss_function)
+            early_stopping(err.item())
             if check_for_nans(gr): 
                 print(iteration, "nans in gradient")
                 break
-            params = [self.phi]
-            if args["train_w"] == 1:
-                gr += torch.norm(self.w.grad.view(-1))
-                params += [self.w]
+            gr = torch.norm(gr)
+            if args["verbose"] and iteration % 10 == 0:
+                print(summary)
+            watch(gr, self.parameters)
+
             if iteration % args["grad_freq"] == 0:
                 grads += [ gr.item()]
-
-            watch(gr, params)
 
             if gr < eps: # or early_stopping.early_stop 
                 print("Early stopping at %d"%iteration)
@@ -247,57 +182,45 @@ class InvariantRiskMinimization(object):
         self.phi = watch.params[0].clone()
         if args["train_w"] == 1:
             self.w = watch.params[1].clone()
+
         return watch.past.item(), grads
 
-    def train_transformed_reg(self, environments, args, reg=0, patience = 15, eps = 1e-05, betas= None, sigmas=None, init_true=0, train_w=False):
-        dim_x = environments[0][0].size(1)
 
-        opt = self.initialize_weights(dim_x, args, init_true = init_true, train_w = train_w, betas= betas, sigmas=sigmas)
+    def create_loss_func(self, betas, sigmas, args, reg, orig_risk, environments):
+        def get_loss(phi, w):
+            error = 0; penalty = 0; err = 0
+            if "popul" in args["method_reg"]:
+                # population risk minimization
+                if orig_risk == False:
+                    # optimize loss with transformed regularization term
+                    err, grads = self.train_popul_transformed_reg(betas, sigmas, args, reg=reg, init_true=args["phi_init"], eps=eps)                
+                    for beta_e, sigma_e in zip(betas, sigmas):
+                        error += ((phi @ w - beta_e).T @ sigma_e @ (phi @ w - beta_e)).sum()
+                        penalty += 4*(phi.T @ sigma_e @ (beta_e - phi @ w) ).pow(2).sum()#.mean()
 
-        loss = torch.nn.MSELoss()
-        early_stopping = EarlyStopping(patience=patience)
-        grads = []
-        watch = BestParameters()
+                    if args["method_reg"] == "irm_popul":
+                        err = error + reg * penalty
+                    else:
+                        err = reg * error + (1 - reg) * penalty
+                elif orig_risk == True :
+                    # optimize loss with original regularization term
+                    for beta_e, sigma_e in zip(betas, sigmas):
+                         
+                        invPhi = torch.inverse(phi.T @ sigma_e @ phi)
+                        PhiD = invPhi @ phi.T @ sigma_e
+                        M = (sigma_e + reg * (PhiD.T @ PhiD))
+                        err = err + ((beta_e - phi @ w).T @ M @ (beta_e - phi @ w) ).squeeze()
+            else:
+                # empricial risk minimization
+                for x_e, y_e in environments:
+                    error_e = (x_e @ phi @ w - y_e).pow(2).mean()
+                    penalty += grad(error_e, w, create_graph=True)[0].pow(2).sum()
+                    error += error_e
+                err = (reg * error + (1 - reg) * penalty)
+            return error, penalty, err
 
-        for iteration in range(args["n_iterations"]):
-            penalty = 0
-            error = 0
-            for x_e, y_e in environments:
-                error_e = loss(x_e @ self.phi @ self.w, y_e)
-                penalty += grad(error_e, self.w,
-                                create_graph=True)[0].pow(2).sum()#.mean()
-                error += error_e
+        return get_loss
 
-            err = (reg * error + (1 - reg) * penalty)
-            w_str = pretty(self.solution())
-            summary = "{:05d} | {:.5f} | {:.5f} | {:.5f} | {}".format(iteration, reg, error, penalty,
-                                                                      w_str)
-            self.make_optimization_step(err, opt, iteration, args, summary)
-            early_stopping(err.item())
-
-            gr = torch.norm(self.phi.grad.view(-1))
-            if check_for_nans(gr): 
-                print(iteration, "nans in gradient")
-                break
-
-            params = [self.phi]
-            if args["train_w"] == 1:
-                gr += torch.norm(self.w.grad.view(-1))
-                params += [self.w]
-            if iteration % args["grad_freq"] == 0:
-                grads += [ gr.item()]
-
-            watch(gr, params)
-
-            if gr < eps: # or early_stopping.early_stop 
-                print("Early stopping at %d"%iteration)
-                break
-
-        print("iteration = ", iteration, "gradient = ", watch.past)
-        self.phi = watch.params[0].clone()
-        if args["train_w"] == 1:
-            self.w = watch.params[1].clone()
-        return grads
 
     def initialize_weights(self, dim_x, args, init_true = 0, betas = None, sigmas=None, train_w= False):
         if init_true == 1:
@@ -336,76 +259,172 @@ class InvariantRiskMinimization(object):
         print("init_w: train_w = ", train_w, " init_Phi: init_true = ", init_true==1)
         return opt
 
-    def get_theta(self):
-        params = []
-        for f in self.parameters:
-            params = params + [torch.flatten(f)]
-        return torch.cat(params, 0)
     
-    def update_theta(self, dtheta):
+    def update_theta(self, dtheta, params):
+        # return unflatten (theta + dtheta)
         curr = 0
-        for p in self.parameters:
+        for p in params:
             Nsize = torch.flatten(p.data).size()[0]
             dpar = dtheta[curr:curr+Nsize].reshape(p.data.size())
             p.data = p.data + dpar
             curr += Nsize
 
-    def zero_grad_newton(self):
-        for p in self.parameters:
-            print("param", p.grad)
-            p.grad.data.zero_()
+    def zero_grad_newton(self, params):
+        for p in params:
+            if p.grad is not None:
+                p.grad.detach_()
+                p.grad.zero_()
+
+    def jacobian(self, y, x, create_graph=False, flatten_x = False):                                        
+        jac = []                                                                                          
+        flat_y = y.view(-1)                                                                          
+        grad_y = torch.zeros_like(flat_y)                                                               
+        for i in range(len(flat_y)):                                                                      
+            grad_y[i] = 1.                                                                                
+            grad_x, = torch.autograd.grad(flat_y, x, grad_y, retain_graph=True, create_graph=create_graph)
+            if not flatten_x:
+                grad_x = grad_x.view(x.shape) 
+            else:
+                grad_x = grad_x.view(-1)
+            jac.append(grad_x)                                                          
+            grad_y[i] = 0. 
+        if not flatten_x:                                                                               
+            return torch.stack(jac).view(y.shape + x.shape)  
+        else:
+            return torch.stack(jac) 
     
-    def newton_step_update(self, loss):
-        def jacobian(y, x, create_graph=False):                                                               
-            jac = []                                                                                          
-            flat_y = y.reshape(-1)                                                                            
-            grad_y = torch.zeros_like(flat_y)                                                                 
-            for i in range(len(flat_y)):                                                                      
-                grad_y[i] = 1.                                                                                
-                grad_x, = torch.autograd.grad(flat_y, x, grad_y, retain_graph=True, create_graph=create_graph)
-                jac.append(grad_x.reshape(x.shape))                                                           
-                grad_y[i] = 0.                                                                                
-            return torch.stack(jac).reshape(y.shape + x.shape)                                                
-                                                                                                              
-        def hessian_grad(y, x):    
-            grd = jacobian(y, x, create_graph=True)                                                                               
-            hess = jacobian(grd, x) 
-            return hess, grd
+    def newton_step_update(self, loss, loss_function, args):                                             
 
-        # compute original gradient, tracking computation graph
-        #self.zero_grad_newton()
-        
-        # flattened parameters
-        theta = self.get_theta()
-        print(theta.size())
+        def hessian_grad_all_params(y, thetas):
+            # x = list(parameters) not flattened 
+            Ndim = 0
+            for p in thetas:
+                Ndim += torch.flatten(p.data).size()[0]
+
+            hessian = torch.zeros((Ndim, Ndim))
+            grad_vec = torch.zeros((Ndim, 1))
+            i_size = 0
+
+            for i, pi in enumerate(thetas):
+                grad_i = self.jacobian(y, pi, create_graph = i==0)
+                pi_size = torch.flatten(pi.data).size()[0] 
+                grad_vec[i_size:i_size+pi_size] = grad_i.data.view(-1, 1)
+                j_size = 0
+                for j, pj in enumerate(thetas):
+                    hess_ij = self.jacobian(grad_i, pj, flatten_x=True, create_graph = j==0)
+                    pj_size = torch.flatten(pj.data).size()[0]  
+                    hessian[i_size:i_size+pi_size, j_size:j_size+pj_size] = hess_ij
+                    hessian[j_size:j_size+pj_size, i_size:i_size+pi_size] = hess_ij.T
+                    j_size += pj_size
+
+                i_size += pi_size
+
+            return hessian, grad_vec
+
+        self.zero_grad_newton(self.parameters)
+
         # take the second gradient
-        hess, grad_vec = hessian_grad(loss, theta)
-
-        # concatenate the results over the different components of the network
+        hess, grad_vec = hessian_grad_all_params(loss, self.parameters)
+        # newton step
+        print("k=", np.linalg.cond(hess.data.numpy()))
         dtheta = - torch.inverse(hess) @ grad_vec.view(-1, 1)
 
-        self.update_theta(dtheta)
-        self.zero_grad_newton()
+        self.update_theta(dtheta, self.parameters)
+
+        print("hess", hess.data.numpy())
+
+        error_hess = self.test_hessian(hess, grad_vec, loss_function, args)
+        print("#"*5 + " Hessian norm ", error_hess)
+
+        return grad_vec
+
+    def test_hessian(self, hess, grad_vec, loss_function, args):
+        def jacobian_all_params(y, thetas):
+            # x = list(parameters) not flattened 
+            Ndim = 0
+            for p in thetas:
+                Ndim += torch.flatten(p.data).size()[0]
+
+            grad_vec = torch.zeros((Ndim, 1))
+            i_size = 0
+
+            for i, pi in enumerate(thetas):
+                grad_i = self.jacobian(y, pi, create_graph=True)
+                pi_size = torch.flatten(pi.data).size()[0] 
+                grad_vec[i_size:i_size+pi_size] = grad_i.data.view(-1, 1)
+
+                i_size += pi_size
+
+            return grad_vec
+
+        # Hv = 1/e * (g(x + ev) - g(x))
+        g1 = grad_vec
+
+        eps = 1#1e-6
+        v = eps*torch.randn(grad_vec.shape)
+
+
+        params = [p.clone() for p in self.parameters]
+
+        if args["train_w"] == 1:
+            phi, w = params
+        else:
+            phi = params[0]
+            w = self.w
+        _, _, loss = loss_function(phi, w)
+        self.zero_grad_newton(params)
+        g12 = jacobian_all_params(loss, params)
+
+        print("g1", g1.squeeze())
+        print("g1_repeat", g12.squeeze())
+
+        self.update_theta(v, params)
+        print("phi", self.phi, "\nphi2", params[0], "\nv", v.squeeze())
+
+        if args["train_w"] == 1:
+            phi, w = params
+        else:
+            phi = params[0]
+            w = self.w
+
+        _, _, loss = loss_function(phi, w)
+        self.zero_grad_newton(params)
+        g2 = jacobian_all_params(loss, params)
+
+        rhs = 1./eps * (g2 - g1)
+
+        print((hess @ v).squeeze())
+        print(rhs.squeeze())
+
+        return torch.norm(hess @ v - rhs).item()
         
 
-    def make_optimization_step(self, err, opt, iteration, args, summary):
+    def make_optimization_step(self, err, opt, iteration, args, summary, loss_function):
 
         if args["optim"] == "newton":
-            self.newton_step_update(err)
+            grads = self.newton_step_update(err, loss_function, args)
+            
             if args["train_w"] == 1:
                 self.phi, self.w = self.parameters
             else:
-                self.phi = self.parameters
+                self.phi = self.parameters[0]
         else:
             opt.zero_grad()
             err.backward()
             opt.step()
 
-        if args["verbose"] and iteration % 10000 == 0:
-            print(summary)
+            grads = self.phi.grad.view(-1)
+            
+            params = [self.phi]
+            if args["train_w"] == 1:
+                grads = torch.cat([grads, self.w.grad.view(-1)], 0)
+                params += [self.w]
+            
 
+            self.parameters = params
 
-
+        #print(self.parameters)
+        return grads
 
 
     def solution(self):
@@ -425,7 +444,7 @@ class InvariantCausalPrediction(object):
         return 2 * min(pvalue_mean, pvalue_var2)
 
 
-    def __init__(self, environments, args, orders=None):
+    def __init__(self, environments, args, orders=None, betas = None, sigmas = None):
 
         def get_pvalue(subset, x_all, y_all, e_all):
             # null hypothesis   H0: S is causal

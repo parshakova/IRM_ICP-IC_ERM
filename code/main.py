@@ -44,6 +44,7 @@ def errors(w, w_hat):
 
 
 def setup_models_environments(args):
+    torch.autograd.set_detect_anomaly(True)
     if args["seed"] >= 0:
         torch.manual_seed(args["seed"])
         numpy.random.seed(args["seed"])
@@ -158,7 +159,7 @@ def solve_irm_erm_icp(args):
         #sol_dict["SEM"] = [sem_solution.numpy(), 0, 0]
 
         for method_name, method_constructor in methods.items():
-            method = method_constructor(environments, args, env_orders)
+            method = method_constructor(environments, args, env_orders, betas = betas_e, sigmas = sigmas_e)
 
             method_solution = sem_scramble @ method.solution()
 
