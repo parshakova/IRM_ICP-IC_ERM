@@ -21,7 +21,8 @@ import statsmodels.api as sm
 import scipy
 from sem import popul_erm_solution
 
-from torch.autograd import grad
+from LBFGS import FullBatchLBFGS
+
 
 import matplotlib
 import matplotlib.pyplot as plt
@@ -104,12 +105,29 @@ class InvariantRiskMinimization(object):
         all_grads = {}
         eps = 1e-04
 
+        if "sci" in args["optim"]:
+            nump_betas = []; nump_sigmas = []
+            for beta_e, sigma_e in zip(betas, sigmas):
+                nump_betas += [beta_e.numpy()]
+                nump_sigmas += [sigma_e.numpy()]
+
+            nump_env = []
+            for x_e, y_e in environments:
+                nump_env += [(x_e.numpy(), y_e.numpy())]
+
         for reg in regs:
 
             loss_function = self.create_loss_func(betas, sigmas, args, reg, orig_risk, env)
+            if "sci" in args["optim"]:
+                sci_loss_function = self.create_loss_func_scipy(nump_betas, nump_sigmas, args, reg, orig_risk, nump_env)
 
-            err, grads = self.train_model(betas, sigmas, args, loss_function, env=env, reg=reg, \
-                                            init_true=args["phi_init"], eps=eps, orig_risk = orig_risk)
+                err, grads = self.scipy_optim_model(betas, sigmas, args, sci_loss_function, loss_function, env=env, reg=reg, \
+                                                init_true=args["phi_init"], eps=eps, orig_risk = orig_risk)
+            else:
+                loss_function = self.create_loss_func(betas, sigmas, args, reg, orig_risk, env)
+
+                err, grads = self.train_model(betas, sigmas, args, loss_function, env=env, reg=reg, \
+                                                init_true=args["phi_init"], eps=eps, orig_risk = orig_risk)
             if not population:
                 err = (x_val @ self.solution() - y_val).pow(2).mean().item()
 
@@ -136,30 +154,97 @@ class InvariantRiskMinimization(object):
         self.all_grads = all_grads
 
 
+    def adjust_learning_rate(self, optimizer, epoch, args):
+        """Sets the learning rate to the initial LR decayed by 10 every 30 epochs"""
+        lr = args["lr"] * (0.1 ** (epoch // 500))
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = lr
+
+    def get_jacobian_scipy(self, args, loss_function):
+        def get_jac(theta):
+            theta = theta.reshape((args["dim"], -1))
+            if args["train_w"] == 1:
+                phi, w = torch.nn.Parameter(torch.tensor(theta[:, :-1])).float(), torch.nn.Parameter(torch.tensor(theta[:, -1:])).float()
+            else:
+                phi = torch.nn.Parameter(torch.tensor(theta[:, :])).float()
+                w = self.w
+            err = loss_function(phi, w)        
+            grads = self.jacobian(err, phi, create_graph=True, flatten_x = False).view(phi.shape)
+            if args["train_w"] == 1:
+                grads = torch.cat([grads, self.jacobian(err, w, create_graph=True, flatten_x = False).view(w.shape)], 1)
+
+            return grads.view(-1).data.numpy()
+
+        return get_jac
+
+
+
+    def scipy_optim_model(self, betas, sigmas, args, sci_loss_function, loss_function, env=None, reg=0, patience=15, init_true=0, eps=1e-05, orig_risk = False):
+        dim_x = betas[0].size(0)
+
+        _ = self.initialize_weights(dim_x, args, init_true = init_true, train_w = args["train_w"] == 1, betas = betas, sigmas=sigmas)
+
+        if args["optim"] == "sci_newton":
+            theta = scipy.optimize.newton(sci_loss_function, self.theta, maxiter = 100*args["n_iterations"])
+        elif args["optim"] == "sci_bfgs":
+            res = scipy.optimize.minimize(sci_loss_function, self.theta, method="BFGS")
+            theta = res.x.reshape((args["dim"], -1))
+        elif args["optim"] == "sci_trkryl":
+            jac_func = self.get_jacobian_scipy(args, loss_function)
+            print(jac_func(self.theta))
+            res = scipy.optimize.minimize(sci_loss_function, self.theta, method="trust-krylov", jac=jac_func)
+            theta = res.x.reshape((args["dim"], -1))
+        elif args["optim"] == "sci_newtoncg":
+            jac_func = self.get_jacobian_scipy(args, loss_function)
+            res = scipy.optimize.minimize(sci_loss_function, self.theta, method="Newton-CG", jac=jac_func)
+            theta = res.x.reshape((args["dim"], -1))
+
+        # update torch parameters with the values foudnd by newton updates
+        if args["train_w"] == 1:
+            self.phi, self.w = torch.nn.Parameter(torch.tensor(theta[:, :-1])).float(), torch.nn.Parameter(torch.tensor(theta[:, -1:])).float()
+        else:
+            self.phi = torch.nn.Parameter(torch.tensor(theta[:, :])).float()
+
+        params = [self.phi]
+        if args["train_w"] == 1:
+            params += [self.w]
+
+        #opt = torch.optim.SGD(params, lr=args["lr"])
+        err = loss_function(self.phi, self.w)
+        
+        grads = self.jacobian(err, params[0], create_graph=True, flatten_x = False).view(-1)
+        if args["train_w"] == 1:
+            grads = torch.cat([grads, self.jacobian(err, params[1], create_graph=True, flatten_x = False).view(-1)], 0)
+                
+        w_str = pretty(self.solution())
+        summary = "{:05d} | {:.5f} | {:.5f} |  {}".format(0, reg, err.item(), w_str)
+
+        gr = torch.norm(grads)
+        self.parameters = params
+        watch = BestParameters()
+        watch(gr, self.parameters)
+        print("iteration = ", None, "gradient = ", watch.past)
+
+        return watch.past.item(), [gr]
+
+
     def train_model(self, betas, sigmas, args, loss_function, env=None, reg=0, patience=15, init_true=0, eps=1e-05, orig_risk = False):
         dim_x = betas[0].size(0)
 
         train_w = args["train_w"] == 1
         opt = self.initialize_weights(dim_x, args, init_true = init_true, train_w = train_w, betas = betas, sigmas=sigmas)
 
-        loss = torch.nn.MSELoss()
-
         early_stopping = EarlyStopping(patience=patience)
-        Id =  torch.eye(dim_x, dim_x)
 
         grads = []
         watch = BestParameters()
 
         for iteration in range(args["n_iterations"]):
 
-            error, penalty, err = loss_function(self.phi, self.w)
+            err = loss_function(self.phi, self.w)
                 
             w_str = pretty(self.solution())
-            if "popul" in args["method_reg"] and orig_risk ==True: 
-                summary = "{:05d} | {:.5f} | {:.5f} |  {}".format(iteration, reg, err.item(), w_str)
-            else:
-                summary = "{:05d} | {:.5f} | {:.5f} | {:.5f} | {}".format(iteration, reg, error, penalty,
-                                                                      w_str)
+            summary = "{:05d} | {:.5f} | {:.5f} |  {}".format(iteration, reg, err.item(), w_str)
 
             gr = self.make_optimization_step(err, opt, iteration, args, summary, loss_function)
             early_stopping(err.item())
@@ -167,12 +252,15 @@ class InvariantRiskMinimization(object):
                 print(iteration, "nans in gradient")
                 break
             gr = torch.norm(gr)
-            if args["verbose"] and iteration % 10 == 0:
+            if args["verbose"] and iteration % 10000 == 0:
                 print(summary)
             watch(gr, self.parameters)
 
             if iteration % args["grad_freq"] == 0:
                 grads += [ gr.item()]
+
+            if args["optim"] == "sgd":
+                self.adjust_learning_rate(opt, iteration, args)
 
             if gr < eps: # or early_stopping.early_stop 
                 print("Early stopping at %d"%iteration)
@@ -187,13 +275,15 @@ class InvariantRiskMinimization(object):
 
 
     def create_loss_func(self, betas, sigmas, args, reg, orig_risk, environments):
-        def get_loss(phi, w):
+        w0 = torch.ones(betas[0].size(0), 1)
+        w0.requires_grad = True
+
+        def get_loss(phi, w=w0):
             error = 0; penalty = 0; err = 0
             if "popul" in args["method_reg"]:
                 # population risk minimization
                 if orig_risk == False:
                     # optimize loss with transformed regularization term
-                    err, grads = self.train_popul_transformed_reg(betas, sigmas, args, reg=reg, init_true=args["phi_init"], eps=eps)                
                     for beta_e, sigma_e in zip(betas, sigmas):
                         error += ((phi @ w - beta_e).T @ sigma_e @ (phi @ w - beta_e)).sum()
                         penalty += 4*(phi.T @ sigma_e @ (beta_e - phi @ w) ).pow(2).sum()#.mean()
@@ -204,20 +294,61 @@ class InvariantRiskMinimization(object):
                         err = reg * error + (1 - reg) * penalty
                 elif orig_risk == True :
                     # optimize loss with original regularization term
-                    for beta_e, sigma_e in zip(betas, sigmas):
-                         
-                        invPhi = torch.inverse(phi.T @ sigma_e @ phi)
-                        PhiD = invPhi @ phi.T @ sigma_e
-                        M = (sigma_e + reg * (PhiD.T @ PhiD))
-                        err = err + ((beta_e - phi @ w).T @ M @ (beta_e - phi @ w) ).squeeze()
+                    for beta_e, sigma_e in zip(betas, sigmas):                         
+                        PhiD = torch.inverse(phi.T @ sigma_e @ phi) @ phi.T @ sigma_e
+                        err += ((beta_e - phi @ w).T @ (sigma_e + reg * (PhiD.T @ PhiD)) @ (beta_e - phi @ w) ).sum()
             else:
                 # empricial risk minimization
                 for x_e, y_e in environments:
                     error_e = (x_e @ phi @ w - y_e).pow(2).mean()
-                    penalty += grad(error_e, w, create_graph=True)[0].pow(2).sum()
+                    penalty += torch.autograd.grad(error_e, w, create_graph=True)[0].pow(2).sum()
                     error += error_e
                 err = (reg * error + (1 - reg) * penalty)
-            return error, penalty, err
+            return err
+
+        return get_loss
+
+
+    def create_loss_func_scipy(self, betas, sigmas, args, reg, orig_risk, environments):
+        
+        w0 = np.ones((args["dim"], 1))
+
+        def get_loss(x):
+            x = x.reshape((args["dim"], -1))
+            #print("x", x.shape)
+            if args["train_w"] == 1:
+                phi = x[:, :-1]
+                w = x[:, -1:]
+            else:
+                phi = x
+                w = w0
+
+            error = 0; penalty = 0; err = 0
+            if "popul" in args["method_reg"]:
+                # population risk minimization
+                if orig_risk == False:
+                    # optimize loss with transformed regularization term
+                    for beta_e, sigma_e in zip(betas, sigmas):
+                        error += ((phi.dot(w) - beta_e).T.dot(sigma_e.dot((phi.dot(w) - beta_e)))).sum()
+                        penalty += 4*((phi.T.dot(sigma_e.dot((beta_e - phi.dot(w)) )**2))).sum()#.mean()
+                    if args["method_reg"] == "irm_popul":
+                        err = error + reg * penalty
+                    else:
+                        err = reg * error + (1 - reg) * penalty
+                elif orig_risk == True :
+                    # optimize loss with original regularization term
+                    for beta_e, sigma_e in zip(betas, sigmas):                         
+                        PhiD = np.linalg.inv(phi.T.dot(sigma_e.dot(phi))).dot(phi.T.dot(sigma_e))
+                        err += ((beta_e - phi.dot(w)).T.dot((sigma_e + reg * (PhiD.T.dot(PhiD))).dot((beta_e - phi.dot(w)) ))).sum()
+            else:
+                # empricial risk minimization
+                for x_e, y_e in environments:
+                    n = y_e.shape[0]*1.
+                    error_e = ((x_e.dot(phi.dot(w)) - y_e)**2).mean()
+                    penalty += 4*((1./n * phi.T.dot(x_e.T.dot(x_e.dot(phi.dot(w)) - y_e)))**2).sum()
+                    error += error_e
+                err = (  reg* error + (1-reg)* penalty)
+            return err
 
         return get_loss
 
@@ -228,35 +359,36 @@ class InvariantRiskMinimization(object):
             eps = torch.normal(mean=torch.zeros(dim_x**2), std=torch.ones(dim_x**2)*1e-5).view(dim_x, dim_x)
             u_hat = popul_erm_solution(betas, sigmas) 
             self.phi = torch.nn.Parameter(torch.diag(u_hat.squeeze()) + eps)
-            params = [self.phi]
-            if train_w:
-                # train parameters w
-                self.w = torch.nn.Parameter(torch.ones(dim_x, 1))
-                params += [self.w]
-            else:
-                # set parameters w = 1 and fix them 
-                self.w = torch.ones(dim_x, 1)
-                self.w.requires_grad = True
         else:
             # randomly initialize parameters Phi
             self.phi = torch.nn.Parameter(torch.randn(dim_x, dim_x))
-            params = [self.phi]
-            if train_w:                
-                self.w = torch.nn.Parameter(torch.randn(dim_x, 1))
-                params += [self.w]
-            else:
-                self.w = torch.randn(dim_x, 1)
-                self.w.requires_grad = True
+
+        params = [self.phi]        
+
+        if train_w:
+            # train parameters w
+            self.w = torch.nn.Parameter(torch.ones(dim_x, 1))
+            params += [self.w]
+        else:
+            # set parameters w = 1 and fix them 
+            self.w = torch.ones(dim_x, 1)
+            self.w.requires_grad = True
 
         if args["optim"] == "adam":
             opt = torch.optim.Adam(params, lr=args["lr"])
         elif args["optim"] == "sgd":
-            opt = torch.optim.SGD(params, lr=args["lr"], momentum=0.9)
+            opt = torch.optim.SGD(params, lr=args["lr"])#, momentum=0.9)
         elif args["optim"] == "newton":
             opt = torch.optim.SGD(params, lr=args["lr"], momentum=0.9)
             self.parameters = params
+        elif "sci" in args["optim"]:
+            opt = None
+            if args["train_w"] ==  1:
+                self.theta = torch.cat((self.phi, self.w),dim=1).data.numpy()
+            else:
+                self.theta = self.phi.data.numpy()
 
-        print("init_w: train_w = ", train_w, " init_Phi: init_true = ", init_true==1)
+        print("init_w ### train_w = ", train_w, " init_Phi: init_true = ", init_true==1)
         return opt
 
     
@@ -280,8 +412,8 @@ class InvariantRiskMinimization(object):
         flat_y = y.view(-1)                                                                          
         grad_y = torch.zeros_like(flat_y)                                                               
         for i in range(len(flat_y)):                                                                      
-            grad_y[i] = 1.                                                                                
-            grad_x, = torch.autograd.grad(flat_y, x, grad_y, retain_graph=True, create_graph=create_graph)
+            grad_y[i] = 1.                                                                
+            grad_x, = torch.autograd.grad(flat_y, x, grad_y, retain_graph=True, create_graph=create_graph)            
             if not flatten_x:
                 grad_x = grad_x.view(x.shape) 
             else:
@@ -297,6 +429,7 @@ class InvariantRiskMinimization(object):
 
         def hessian_grad_all_params(y, thetas):
             # x = list(parameters) not flattened 
+            # TODO: retain_grad, gradients disappear when calling autograd multiple times
             Ndim = 0
             for p in thetas:
                 Ndim += torch.flatten(p.data).size()[0]
@@ -314,7 +447,6 @@ class InvariantRiskMinimization(object):
                     hess_ij = self.jacobian(grad_i, pj, flatten_x=True, create_graph = j==0)
                     pj_size = torch.flatten(pj.data).size()[0]  
                     hessian[i_size:i_size+pi_size, j_size:j_size+pj_size] = hess_ij
-                    hessian[j_size:j_size+pj_size, i_size:i_size+pi_size] = hess_ij.T
                     j_size += pj_size
 
                 i_size += pi_size
@@ -322,24 +454,48 @@ class InvariantRiskMinimization(object):
             return hessian, grad_vec
 
         self.zero_grad_newton(self.parameters)
-
+        np.set_printoptions(precision=4)
         # take the second gradient
-        hess, grad_vec = hessian_grad_all_params(loss, self.parameters)
+        grad_vec = self.jacobian_all_params(loss, self.parameters)
+        if args["train_w"] == 1:
+            hess = torch.autograd.functional.hessian(loss_function, tuple(self.parameters))
+        else:
+            hess = torch.autograd.functional.hessian(loss_function, self.parameters[0])
+        
+        Ndim = 0
+        for p in self.parameters:
+            Ndim += torch.flatten(p.data).size()[0]
+
+        hessian = torch.zeros((Ndim, Ndim))
+        # combine tuples of hessian into a single matrix
+        i_size = 0
+        for i, pi in enumerate(self.parameters):
+            pi_size = torch.flatten(pi.data).size()[0] 
+            j_size = 0
+            for j, pj in enumerate(self.parameters):
+                pj_size = torch.flatten(pj.data).size()[0] 
+                hess_ij = hess[i][j].double().reshape(pi_size, pj_size)
+                # pi.shape x pj.shape ==> pi.flatten x pj.flatten
+                hessian[i_size:i_size+pi_size, j_size:j_size + pj_size] = hess_ij
+                j_size += pj_size
+
+            i_size += pi_size
+
         # newton step
-        print("k=", np.linalg.cond(hess.data.numpy()))
-        dtheta = - torch.inverse(hess) @ grad_vec.view(-1, 1)
+        print("k=", np.linalg.cond(hessian.data.numpy()))
 
-        self.update_theta(dtheta, self.parameters)
-
-        print("hess", hess.data.numpy())
-
-        error_hess = self.test_hessian(hess, grad_vec, loss_function, args)
-        print("#"*5 + " Hessian norm ", error_hess)
-
+        hess2 = self.get_hessian_manually(grad_vec, loss_function, args, Ndim)
+        print("hess2", torch.isclose(hess2.T, hess2).data.numpy())
+        np.savetxt('hess2.txt', hess2.data.numpy(), delimiter='  ', fmt='%1.0e') 
+        print("k2=", np.linalg.cond(hess2.data.numpy()))
+        
+        dtheta = - torch.inverse(hessian) @ grad_vec.view(-1, 1)
+        self.update_theta(dtheta, self.parameters)        
+              
+        assert 1 == 0
         return grad_vec
 
-    def test_hessian(self, hess, grad_vec, loss_function, args):
-        def jacobian_all_params(y, thetas):
+    def jacobian_all_params(self, y, thetas):
             # x = list(parameters) not flattened 
             Ndim = 0
             for p in thetas:
@@ -357,47 +513,37 @@ class InvariantRiskMinimization(object):
 
             return grad_vec
 
+
+    def get_hessian_manually(self, g1, loss_function, args, Ndim):
+
         # Hv = 1/e * (g(x + ev) - g(x))
-        g1 = grad_vec
+        hessian = torch.zeros((Ndim, Ndim))
 
-        eps = 1#1e-6
-        v = eps*torch.randn(grad_vec.shape)
+        eps = 1e-4
+        v = torch.zeros(Ndim, 1)
+        for i in range(Ndim):
+            v[i] = 1
 
+            params = [p.clone() for p in self.parameters]
 
-        params = [p.clone() for p in self.parameters]
+            self.update_theta(eps*v, params)
+            self.zero_grad_newton(params)
 
-        if args["train_w"] == 1:
-            phi, w = params
-        else:
-            phi = params[0]
-            w = self.w
-        _, _, loss = loss_function(phi, w)
-        self.zero_grad_newton(params)
-        g12 = jacobian_all_params(loss, params)
+            if args["train_w"] == 1:
+                phi, w = params
+            else:
+                phi = params[0]
+                w = self.w
 
-        print("g1", g1.squeeze())
-        print("g1_repeat", g12.squeeze())
+            loss = loss_function(phi, w)
+            self.zero_grad_newton(params)
+            g2 = self.jacobian_all_params(loss, params)
 
-        self.update_theta(v, params)
-        print("phi", self.phi, "\nphi2", params[0], "\nv", v.squeeze())
+            H_i = 1./eps * (g2 - g1)
+            hessian[:, i:i+1] = H_i
+            v[i] = 0
 
-        if args["train_w"] == 1:
-            phi, w = params
-        else:
-            phi = params[0]
-            w = self.w
-
-        _, _, loss = loss_function(phi, w)
-        self.zero_grad_newton(params)
-        g2 = jacobian_all_params(loss, params)
-
-        rhs = 1./eps * (g2 - g1)
-
-        print((hess @ v).squeeze())
-        print(rhs.squeeze())
-
-        return torch.norm(hess @ v - rhs).item()
-        
+        return hessian
 
     def make_optimization_step(self, err, opt, iteration, args, summary, loss_function):
 
